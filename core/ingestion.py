@@ -443,8 +443,23 @@ def _ocr_image_to_lines(img_path: Path, lang: str = "eng") -> list[str]:
     img = Image.open(str(img_path))
     img = ImageOps.exif_transpose(img)
     img = img.convert("L")
+
+    # Upscale very small images before contrast/sharpen (improves Tesseract accuracy)
+    w, h = img.size
+    if w < 1500:
+        scale = 1500 / w
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
     img = ImageEnhance.Contrast(img).enhance(1.8)
     img = img.filter(ImageFilter.SHARPEN)
+
+    # Deskew with a conservative angle limit so tilted statement photos OCR better.
+    # Using 20° cap avoids catastrophic rotation on images that are merely wide-angle.
+    try:
+        from core.ocr import deskew_image
+        img = deskew_image(img, max_angle=20.0)
+    except Exception:
+        pass
 
     raw = _tess.image_to_data(
         img, lang=lang, config="--psm 6 --oem 1",

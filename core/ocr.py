@@ -66,7 +66,16 @@ _HAS_CHINESE: bool = "chi_sim" in _OCR_LANG or "chi_tra" in _OCR_LANG
 # Image preprocessing
 # ---------------------------------------------------------------------------
 
-def _deskew_cv2(img: "Image.Image") -> "Image.Image":
+def deskew_image(img: "Image.Image", max_angle: float = 20.0) -> "Image.Image":
+    """
+    Detect and correct text skew using OpenCV.
+    max_angle: skip correction if detected angle exceeds this (degrees).
+    Returns the original image unchanged if OpenCV is unavailable or angle is too large.
+    """
+    return _deskew_cv2(img, max_angle=max_angle)
+
+
+def _deskew_cv2(img: "Image.Image", max_angle: float = 45.0) -> "Image.Image":
     """Use OpenCV to detect and correct text skew angle."""
     if not _CV2:
         return img
@@ -80,7 +89,7 @@ def _deskew_cv2(img: "Image.Image") -> "Image.Image":
         # minAreaRect returns angle in [-90, 0); convert to actual skew
         if angle < -45:
             angle = 90 + angle
-        if abs(angle) < 0.5 or abs(angle) > 45:
+        if abs(angle) < 0.5 or abs(angle) > max_angle:
             return img
         (h, w) = arr.shape
         center = (w // 2, h // 2)

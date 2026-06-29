@@ -122,7 +122,7 @@ def _parse_retail(text: str) -> ReceiptData:
             if r.total is None or val > r.total:
                 r.total = val
 
-    # Fallback: credit-card terminal "Amount" line (often more reliable than receipt total)
+    # Fallback 1: credit-card terminal "Amount" line (often more reliable than receipt total)
     if r.total is None:
         for line in lines:
             if re.search(r"\bamount\b", line, re.I):
@@ -130,6 +130,22 @@ def _parse_retail(text: str) -> ReceiptData:
                 if val:
                     r.total = val
                     break
+
+    # Fallback 2: POS thermal slips where "Amount" and the value are on separate lines
+    # and OCR breaks the decimal: e.g. "mount =" then "圖 4000000004 1019 78 2" → $78.20
+    if r.total is None:
+        for i, line in enumerate(lines):
+            if re.search(r"mount", line, re.I) and i + 1 < len(lines):
+                digits = re.findall(r"\d+", lines[i + 1])
+                # Need the last two groups where the second looks like cents (≤2 digits)
+                if len(digits) >= 2 and len(digits[-1]) <= 2:
+                    try:
+                        candidate = float(f"{digits[-2]}.{digits[-1].ljust(2, '0')}")
+                        if 0.01 < candidate < 50000:
+                            r.total = round(candidate, 2)
+                    except ValueError:
+                        pass
+                break
 
     # Derive tax_total
     parts = [x for x in [r.tax_gst, r.tax_hst, r.tax_pst] if x]
@@ -164,7 +180,7 @@ def _parse_invoice(text: str) -> ReceiptData:
     for line in text.splitlines()[:15]:
         line = line.strip()
         # "alesman" catches OCR of "Salesman:" ("S" sometimes dropped)
-        if re.search(r"alesman|ship\s*via|p\.?o\.?\s*no|unit.?price|invoice", line, re.I):
+        if re.search(r"ali?esman|ship\s*via|p\.?o\.?\s*no|unit.?price|invoice", line, re.I):
             break
         if _MONEY_RE.search(line):            # skip lines with prices (product rows)
             continue
@@ -175,6 +191,30 @@ def _parse_invoice(text: str) -> ReceiptData:
             if len(re.sub(r"[^A-Za-z]", "", candidate)) >= 5:
                 if not r.vendor:
                     r.vendor = candidate
+
+    # CJK brand fallback: if no ASCII vendor found, count the most common 2-character
+    # CJK bigram across product lines — Tesseract spaces out hanzi ("唐 龍") so we
+    # work with adjacent-character pairs extracted from runs of CJK chars and spaces.
+    if not r.vendor:
+        from collections import Counter
+        # Units, quantities and Chinese numerals — not brand material
+        _CJK_SKIP = set("合打磅粒到有和的盒罐袋個等份包件瓶支條塊一二三四五六七八九十百千萬")
+        # Collapse spaces between CJK chars to find runs, then form bigrams
+        cjk_runs = re.findall(r"(?:[一-鿿]\s*){2,}", text)
+        bigrams: list[str] = []
+        for run in cjk_runs:
+            chars = re.findall(r"[一-鿿]", run)
+            for i in range(len(chars) - 1):
+                bg = chars[i] + chars[i + 1]
+                # Skip if both chars are the same (noise) or either is a unit/numeral
+                if bg[0] == bg[1] or any(c in _CJK_SKIP for c in bg):
+                    continue
+                bigrams.append(bg)
+        if bigrams:
+            freq = Counter(bigrams)
+            brand, count = freq.most_common(1)[0]
+            if count >= 3:  # must appear in ≥3 product lines to be reliable
+                r.vendor = brand
 
     # Extract line items — line-by-line: need product code AND a $ amount
     items = []
