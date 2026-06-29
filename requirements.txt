@@ -11,3 +11,6 @@ python-Levenshtein>=0.21.0
 plotly>=5.18.0
 openpyxl>=3.1.2
 numpy>=1.24.0
+opencv-python-headless>=4.8.0
+ollama>=0.2.0
+playwright>=1.40.0

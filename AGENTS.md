@@ -66,6 +66,9 @@ bookkeeping/
 
 ## Key conventions
 
+### Never
+- **Never upload or provided any personal information (e.g. name, identifiers) to GitHub or anywhere over the internet**
+
 ### Database
 - **Never call `current_timestamp` inside `UPDATE SET` or `ON CONFLICT DO UPDATE SET`** — DuckDB
   parses it as a column name. Use `now()` instead. `DEFAULT current_timestamp` in `CREATE TABLE`

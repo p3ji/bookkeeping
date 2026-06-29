@@ -13,7 +13,8 @@ from core.database import (
 )
 from core.audit import check_audit_flags
 from core.tax import calculate_net, calculate_deductible
-from core.ocr import render_pdf_preview, extract_text
+from core.ocr import render_pdf_preview, render_image_preview, extract_text
+from core.receipt_parser import extract_receipt_data
 from core.export import export_transaction_md
 from config import CRA_LINES, RECEIPTS_DIR
 
@@ -136,7 +137,39 @@ with col_receipt:
             else:
                 st.warning("PDF preview unavailable (PyMuPDF not installed).")
         else:
-            st.image(str(rp), use_container_width=True)
+            # Use EXIF-corrected preview so phone photos show right-side up
+            img_bytes = render_image_preview(rp)
+            if img_bytes:
+                st.image(img_bytes, use_container_width=True)
+            else:
+                st.image(str(rp), use_container_width=True)
+
+        # Show structured data extracted from receipt
+        raw_text = tx.get("raw_receipt_text") or ""
+        if raw_text:
+            data = extract_receipt_data(raw_text)
+            with st.expander("📋 Extracted Receipt Data"):
+                if data.vendor:
+                    st.write(f"**Vendor:** {data.vendor}")
+                if data.date:
+                    st.write(f"**Date:** {data.date}")
+                if data.total is not None:
+                    st.write(f"**Total:** ${data.total:.2f}")
+                taxes = {}
+                if data.tax_hst:
+                    taxes["HST"] = data.tax_hst
+                if data.tax_gst:
+                    taxes["GST"] = data.tax_gst
+                if data.tax_pst:
+                    taxes["PST"] = data.tax_pst
+                if taxes:
+                    st.write("**Tax:** " + "  |  ".join(
+                        f"{k}: ${v:.2f}" for k, v in taxes.items()
+                    ))
+                if data.line_items:
+                    st.write(f"**Line items:** {len(data.line_items)}")
+                    st.dataframe(data.line_items, hide_index=True,
+                                 use_container_width=True)
     else:
         st.markdown("**No receipt matched.**")
         with st.expander("📎 Attach receipt manually"):

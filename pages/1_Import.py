@@ -1,4 +1,4 @@
-"""Import page — CSV upload and receipt scanning."""
+"""Import page — CSV upload, statement OCR, web-based bill extraction."""
 import io
 from pathlib import Path
 
@@ -10,6 +10,8 @@ from core.database import init_db, get_setting
 from core.ingestion import import_csv, import_statement
 from core.matching import index_receipts, match_all_transactions
 from core.ocr import ocr_capabilities
+from core.llm_extractor import is_ollama_available, ollama_vision_model, INSTALL_INSTRUCTIONS
+from core.playwright_extractor import is_playwright_available, extract_from_url, extract_from_html_file
 from config import IMPORTS_DIR, RECEIPTS_DIR
 
 init_db()
@@ -18,15 +20,16 @@ st.title("📥 Import")
 
 province = get_setting("province", "ON")
 ocr = ocr_capabilities()
+_pw_ok = is_playwright_available()
 
 # ---------------------------------------------------------------------------
-# Section 1: CSV Import
+# Section 1: Credit Card Statement
 # ---------------------------------------------------------------------------
 st.header("1. Credit Card Statement")
-st.caption("Upload a Costco Mastercard (Capital One) CSV export, or drop the file into the `imports/` folder.")
+st.caption("Upload a CSV export, drop a PDF/image, or extract from a web-based bill page.")
 
-tab_upload, tab_folder, tab_statement = st.tabs(
-    ["Upload CSV", "From imports/ Folder", "Statement PDF / Image"]
+tab_upload, tab_folder, tab_statement, tab_web = st.tabs(
+    ["Upload CSV", "From imports/ Folder", "Statement PDF / Image", "From URL / HTML (Playwright)"]
 )
 
 with tab_upload:
@@ -65,13 +68,32 @@ with tab_folder:
                     st.error(f"Import failed: {e}", icon="🚨")
 
 with tab_statement:
+    _ollama_ok = is_ollama_available()
+    _ollama_model = ollama_vision_model() if _ollama_ok else None
+
+    # Mode selector: LLM (if available) or Tesseract OCR
+    if _ollama_ok:
+        extract_mode = st.radio(
+            "Extraction engine",
+            ["🤖 Vision LLM (Ollama — recommended for photos)", "🔤 Tesseract OCR"],
+            horizontal=True,
+            key="stmt_mode",
+        )
+        use_llm = "LLM" in extract_mode
+        st.caption(f"Using model: `{_ollama_model}`")
+    else:
+        use_llm = False
+        with st.expander("💡 Better extraction available — click to learn more"):
+            st.markdown(INSTALL_INSTRUCTIONS)
+
     st.markdown(
         "Upload a credit card statement as a **PDF, JPEG, or PNG**. "
-        "The app will OCR it and extract individual transactions automatically. "
-        "Works on downloaded PDF statements and phone photos of paper statements."
+        "For **digital PDFs** (downloaded from your bank portal) Tesseract works great. "
+        "For **phone photos** of paper statements, the Vision LLM gives much better results."
     )
-    if not ocr["pdfplumber"] and not ocr["tesseract"]:
-        st.error("No OCR libraries available. Install pdfplumber and/or Tesseract.", icon="🚨")
+
+    if not ocr["pdfplumber"] and not ocr["tesseract"] and not _ollama_ok:
+        st.error("No extraction libraries available. Install pdfplumber, Tesseract, or Ollama.", icon="🚨")
     else:
         stmt_file = st.file_uploader(
             "Upload statement",
@@ -86,35 +108,178 @@ with tab_statement:
             step=1,
         )
         if stmt_file and st.button("Parse & Import Statement", key="btn_stmt", type="primary"):
-            with st.spinner("Extracting transactions via OCR — this may take a moment…"):
+            if use_llm and _ollama_ok:
+                # Save temp file, run vision LLM, import results
+                import tempfile, os as _os
+                from core.ingestion import import_statement_rows
+                suffix = Path(stmt_file.name).suffix or ".jpg"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(stmt_file.read())
+                    tmp_path = Path(tmp.name)
                 try:
-                    result = import_statement(
-                        stmt_file.read(),
-                        filename=stmt_file.name,
-                        province=province,
-                        default_year=int(stmt_year),
-                    )
+                    with st.spinner(f"Analysing image with `{_ollama_model}` — may take 10-30 s…"):
+                        from core.llm_extractor import extract_statement_transactions
+                        rows = extract_statement_transactions(tmp_path, int(stmt_year))
+                finally:
+                    _os.unlink(tmp_path)
+
+                if not rows:
+                    st.error("LLM returned no transactions. Try Tesseract OCR mode instead.", icon="🚨")
+                else:
+                    result = import_statement_rows(rows, filename=stmt_file.name, province=province)
                     st.success(
                         f"Imported **{result['new_records']}** transactions "
-                        f"from `{stmt_file.name}` ({result['total_rows']} found).",
+                        f"from `{stmt_file.name}` via Vision LLM.",
                         icon="✅",
                     )
                     if result.get("preview"):
-                        st.markdown("**Preview (first 10):**")
                         st.dataframe(result["preview"], hide_index=True)
-                except Exception as e:
-                    msg = str(e)
-                    if "\n\nRaw extracted text" in msg:
-                        headline, _, raw = msg.partition("\n\nRaw extracted text")
-                        st.error(headline, icon="🚨")
-                        with st.expander("🔍 Raw extracted text (debug)"):
-                            st.text(raw.replace("(first 3000 chars):\n", ""))
+            else:
+                with st.spinner("Extracting transactions via OCR — this may take a moment…"):
+                    try:
+                        result = import_statement(
+                            stmt_file.read(),
+                            filename=stmt_file.name,
+                            province=province,
+                            default_year=int(stmt_year),
+                        )
+                        st.success(
+                            f"Imported **{result['new_records']}** transactions "
+                            f"from `{stmt_file.name}` ({result['total_rows']} found).",
+                            icon="✅",
+                        )
+                        if result.get("preview"):
+                            st.markdown("**Preview (first 10):**")
+                            st.dataframe(result["preview"], hide_index=True)
+                    except Exception as e:
+                        msg = str(e)
+                        if "\n\nRaw extracted text" in msg:
+                            headline, _, raw = msg.partition("\n\nRaw extracted text")
+                            st.error(headline, icon="🚨")
+                            with st.expander("🔍 Raw extracted text (debug)"):
+                                st.text(raw.replace("(first 3000 chars):\n", ""))
+                        else:
+                            st.error(f"Statement parsing failed: {msg}", icon="🚨")
+                        st.caption(
+                            "Tip: For best results with phone photos, install Ollama + llama3.2-vision. "
+                            "For digital statements, export as CSV or PDF from your bank portal."
+                        )
+
+with tab_web:
+    st.markdown(
+        "Extract transactions or bill data from **web-rendered pages** — online banking portals, "
+        "telecom My Account bills (Rogers, Bell, Telus, Freedom Mobile), or saved HTML files. "
+        "Playwright handles JavaScript-rendered content that plain URL fetching misses."
+    )
+
+    if not _pw_ok:
+        st.error(
+            "Playwright is not available. Run `pip install playwright` then "
+            "`playwright install chromium`.",
+            icon="🚨",
+        )
+    else:
+        web_mode = st.radio(
+            "Source",
+            ["🌐 URL (online portal)", "📄 Local HTML file"],
+            horizontal=True,
+            key="web_mode",
+        )
+
+        if "URL" in web_mode:
+            web_url = st.text_input(
+                "Bill or statement URL",
+                placeholder="https://myaccount.freedommobile.ca/billing/current",
+                key="web_url",
+            )
+            source_label = web_url
+            use_local = False
+        else:
+            html_files = list(IMPORTS_DIR.glob("*.html")) + list(IMPORTS_DIR.glob("*.htm"))
+            if html_files:
+                chosen_html = st.selectbox(
+                    "Select HTML file from imports/",
+                    [f.name for f in html_files],
+                    key="html_sel",
+                )
+                source_label = chosen_html
+                use_local = True
+            else:
+                st.info(f"No HTML files found in `{IMPORTS_DIR}`. Drop a saved bill page there.")
+                source_label = None
+                use_local = False
+
+        from datetime import date as _today2
+        web_year = st.number_input(
+            "Year (for statement transaction dates)",
+            min_value=2015, max_value=_today2.today().year + 1,
+            value=_today2.today().year, step=1, key="web_year",
+        )
+
+        if source_label and st.button("Extract & Import", key="btn_web", type="primary"):
+            with st.spinner("Launching Playwright browser — this may take a few seconds…"):
+                try:
+                    if use_local:
+                        result_pw = extract_from_html_file(
+                            IMPORTS_DIR / chosen_html,
+                            default_year=int(web_year),
+                        )
                     else:
-                        st.error(f"Statement parsing failed: {msg}", icon="🚨")
-                    st.caption(
-                        "Tip: If this is a scanned/photographed statement, ensure Tesseract is installed. "
-                        "For best results, export your statement as CSV from the bank portal."
+                        result_pw = extract_from_url(web_url, default_year=int(web_year))
+                except Exception as exc:
+                    st.error(f"Playwright extraction failed: {exc}", icon="🚨")
+                    result_pw = None
+
+            if result_pw:
+                st.success(
+                    f"Extracted `{result_pw['doc_type']}` document via Playwright.",
+                    icon="✅",
+                )
+
+                rd = result_pw.get("receipt_data")
+                txs = result_pw.get("transactions", [])
+
+                if rd and rd.doc_type != "unknown":
+                    import dataclasses
+                    d = dataclasses.asdict(rd)
+                    d.pop("raw_text", None)
+                    items = d.pop("line_items", [])
+                    st.markdown("**Extracted bill data:**")
+                    col_a, col_b = st.columns(2)
+                    col_a.metric("Vendor", rd.vendor or "—")
+                    col_b.metric("Total Due", f"${rd.total:.2f}" if rd.total else "—")
+                    col_a.metric("Date", rd.date or "—")
+                    col_b.metric("HST", f"${rd.tax_hst:.2f}" if rd.tax_hst else "—")
+                    if items:
+                        st.dataframe(items, hide_index=True, use_container_width=True)
+
+                    # Import the bill as a single transaction
+                    if rd.total and rd.vendor:
+                        if st.button("Import as transaction", key="btn_web_import"):
+                            from core.ingestion import import_statement_rows
+                            rows = [{"date": rd.date or str(_today2.today()),
+                                     "vendor": rd.vendor,
+                                     "amount_gross": rd.total}]
+                            res = import_statement_rows(rows, filename=source_label, province=province)
+                            st.success(
+                                f"Imported **{res['new_records']}** transaction(s) from `{source_label}`.",
+                                icon="✅",
+                            )
+
+                elif txs:
+                    from core.ingestion import import_statement_rows
+                    res = import_statement_rows(txs, filename=source_label, province=province)
+                    st.success(
+                        f"Imported **{res['new_records']}** transactions from `{source_label}`.",
+                        icon="✅",
                     )
+                    if res.get("preview"):
+                        st.dataframe(res["preview"], hide_index=True)
+                else:
+                    st.warning("No structured data extracted. Check raw text below.", icon="⚠️")
+
+                with st.expander("Raw extracted text"):
+                    st.text(result_pw.get("raw_text", "")[:3000])
 
 st.divider()
 

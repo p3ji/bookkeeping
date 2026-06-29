@@ -6,6 +6,7 @@ st.set_page_config(page_title="Settings", page_icon="⚙️", layout="wide")
 from core.database import init_db, get_setting, save_setting
 from core.export import export_all_verified
 from core.ocr import ocr_capabilities
+from core.playwright_extractor import is_playwright_available
 from config import TAX_RATES, EXPORTS_DIR, RECEIPTS_DIR, IMPORTS_DIR
 
 init_db()
@@ -87,6 +88,11 @@ rows = [
     ("Chinese OCR (chi_sim / chi_tra)", caps["chinese"],
      "Simplified & Traditional Chinese receipt text",
      "In Tesseract installer → Additional language data, tick **Chinese (Simplified)** and **Chinese (Traditional)**"),
+    ("OpenCV", caps.get("opencv", False), "Image deskew & fine rotation correction",
+     "`pip install opencv-python-headless`"),
+    ("Playwright + Chromium", is_playwright_available(),
+     "Web-based bill/statement extraction (telecom portals, online banking)",
+     "`pip install playwright` then `playwright install chromium`"),
 ]
 
 for name, ok, purpose, fix in rows:

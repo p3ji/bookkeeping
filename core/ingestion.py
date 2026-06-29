@@ -257,25 +257,30 @@ _SKIP_KEYWORDS: set[str] = {
     "closing balance", "annual fee", "thank you", "rewards", "page",
     "billing period", "customer service", "tel:", "www.", ".com",
     "void", "subtotal", "fee", "apr", "annual percentage",
+    "information about", "your payment", "amount due",
 }
 
-# Date at line start, amount at line end
-_LINE_TX_RE = re.compile(
-    r"""
-    ^
-    (?:                                              # date group (various formats)
-        (\d{4}-\d{2}-\d{2})                         #  YYYY-MM-DD
-        |(\d{1,2}/\d{1,2}(?:/\d{2,4})?)             #  MM/DD or MM/DD/YYYY
-        |([A-Za-z]{3}\.?\s+\d{1,2}(?:[,\s]+\d{4})?) #  Jan 15 or Jan 15, 2025
-    )
-    \s+
-    (.+?)                                            # vendor (non-greedy)
-    \s+
-    ([\d,]+\.\d{2})                                 # amount
-    \s*(?:CR)?\s*
-    $
-    """,
-    re.VERBOSE,
+# CIBC Costco MC spend category labels that sit between vendor and amount
+_CIBC_CATEGORIES: tuple[str, ...] = (
+    "Restaurants",
+    "Retail and Grocery",
+    "Personal and Household Expenses",
+    "Professional and Financial Services",
+    "Foreign Currency Transactions",
+    "Transportation",
+    "Health and Education",
+    "Home and Office Improvement",
+    "Entertainment",
+    "Education",
+    "Gas and Automobile",
+    "Travel",
+    "Insurance",
+    "Utilities",
+)
+# Build a regex to strip category labels (case-insensitive) from end of vendor string
+_CATEGORY_STRIP_RE = re.compile(
+    r"\s+(" + "|".join(re.escape(c) for c in _CIBC_CATEGORIES) + r")\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -289,20 +294,25 @@ def _line_to_tx(line: str, default_year: int) -> dict | None:
     if any(kw in lower for kw in _SKIP_KEYWORDS):
         return None
 
-    # Amount must be at end
-    amt_m = re.search(r"([\d,]+\.\d{2})\s*(?:CR)?\s*$", line)
-    if not amt_m:
-        return None
+    # Strip trailing OCR punctuation that often appears after amounts (e.g. "59.3.")
+    line = re.sub(r"([0-9])[.\s]+$", r"\1", line).strip()
 
-    amount = _parse_amount(amt_m.group(1))
-    if not amount or amount <= 0:
+    # Amount must be at end — allow 1 or 2 decimal digits (OCR sometimes drops trailing zero)
+    amt_m = re.search(r"([\d,]+\.\d{1,2})\s*(?:CR)?\s*$", line)
+    if not amt_m:
         return None
 
     # Skip credits/refunds (CR suffix)
     if line.rstrip().upper().endswith("CR"):
         return None
 
+    amount = _parse_amount(amt_m.group(1))
+    if not amount or amount <= 0:
+        return None
+
     prefix = line[: amt_m.start()].strip()
+    # Strip leading OCR garbage (|, @, ., 一, etc.) before the date
+    prefix = re.sub(r"^[^A-Za-z0-9]+", "", prefix).strip()
     if not prefix:
         return None
 
@@ -314,6 +324,7 @@ def _line_to_tx(line: str, default_year: int) -> dict | None:
         re.compile(r"^\d{1,2}/\d{1,2}"),
         re.compile(r"^[A-Za-z]{3}\.?\s+\d{1,2}[,\s]+\d{4}"),
         re.compile(r"^[A-Za-z]{3}\.?\s+\d{1,2}"),
+        re.compile(r"^[A-Za-z]{3}\d{1,2}"),    # compact: "Jun19" (no space — OCR artifact)
     ]
     date_str = None
     vendor_str = prefix
@@ -322,27 +333,45 @@ def _line_to_tx(line: str, default_year: int) -> dict | None:
         m = pat.match(prefix)
         if m:
             raw_date = m.group(0)
-            # Append default year if only MM/DD or Mon DD found
             if re.match(r"^\d{1,2}/\d{1,2}$", raw_date):
                 raw_date = f"{raw_date}/{default_year}"
             elif re.match(r"^[A-Za-z]{3}\.?\s+\d{1,2}$", raw_date):
                 raw_date = f"{raw_date} {default_year}"
-            date_str = _parse_date(raw_date)
-            # Vendor is whatever follows the date; might start with a second date
+            raw_date_clean = raw_date
+            # Normalise compact format "Jun19" → "Jun 19"
+            compact_m = re.match(r"^([A-Za-z]{3})(\d{1,2})$", raw_date.strip())
+            if compact_m:
+                raw_date_clean = f"{compact_m.group(1)} {compact_m.group(2)}"
+            if re.match(r"^\d{1,2}/\d{1,2}$", raw_date_clean):
+                raw_date_clean = f"{raw_date_clean}/{default_year}"
+            elif re.match(r"^[A-Za-z]{3}\.?\s+\d{1,2}$", raw_date_clean):
+                raw_date_clean = f"{raw_date_clean} {default_year}"
+            date_str = _parse_date(raw_date_clean)
             remainder = prefix[m.end():].strip()
             # Drop a trailing second date (Posted vs Transaction date columns)
             sec = re.match(r"^\d{1,2}/\d{1,2}(?:/\d{2,4})?\s*", remainder)
             if not sec:
-                sec = re.match(r"^[A-Za-z]{3}\.?\s+\d{1,2}(?:[,\s]+\d{4})?\s*", remainder)
+                sec = re.match(r"^[A-Za-z]{3}\.?\s*\d{1,2}(?:[,\s]+\d{4})?\s*", remainder)
+            if not sec:
+                sec = re.match(r"^[A-Za-z]{3}\d{1,2}\s*", remainder)  # compact second date
             vendor_str = remainder[sec.end():].strip() if sec else remainder
             break
 
     if not date_str or not vendor_str or len(vendor_str) < 2:
         return None
 
-    # Drop reference/confirmation numbers (long digit strings at start of vendor)
+    # Drop long reference/confirmation numbers at start of vendor
     vendor_str = re.sub(r"^\d{6,}\s*", "", vendor_str).strip()
-    if not vendor_str:
+
+    # Strip CIBC spend category labels from end of vendor string
+    vendor_str = _CATEGORY_STRIP_RE.sub("", vendor_str).strip()
+
+    # Strip trailing province codes (ON, BC, QC, AB, etc.) and city left-overs
+    vendor_str = re.sub(
+        r"\s+\b(ON|BC|AB|QC|MB|SK|NS|NB|PE|NL|NT|NU|YT)\b\s*$", "", vendor_str
+    ).strip()
+
+    if not vendor_str or len(vendor_str) < 2:
         return None
 
     return {
@@ -393,6 +422,171 @@ def _extract_via_tables(pdf_path: Path, default_year: int) -> list[dict]:
                             })
     except Exception:
         pass
+    return results
+
+
+def _ocr_image_to_lines(img_path: Path, lang: str = "eng") -> list[str]:
+    """
+    Open, preprocess and OCR an image; return Tesseract-native text lines
+    grouped by (block, paragraph, line) for multi-column statement fidelity.
+    Uses English-only by default for statements (avoids Chinese model interference).
+    """
+    import pytesseract as _tess
+    import pandas as pd
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+    from config import TESSERACT_PATH
+    import os
+
+    if os.path.exists(TESSERACT_PATH):
+        _tess.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+    img = Image.open(str(img_path))
+    img = ImageOps.exif_transpose(img)
+    img = img.convert("L")
+    img = ImageEnhance.Contrast(img).enhance(1.8)
+    img = img.filter(ImageFilter.SHARPEN)
+
+    raw = _tess.image_to_data(
+        img, lang=lang, config="--psm 6 --oem 1",
+        output_type=_tess.Output.DATAFRAME,
+    )
+    raw["conf"] = pd.to_numeric(raw["conf"], errors="coerce")
+    raw = raw[(raw["conf"] > 20) & (raw["text"].fillna("").str.strip() != "")]
+
+    lines: list[str] = []
+    for _key, grp in raw.groupby(["block_num", "par_num", "line_num"]):
+        text = " ".join(grp.sort_values("left")["text"].fillna("").astype(str).values).strip()
+        if text:
+            lines.append(text)
+    return lines
+
+
+def _extract_via_image_words(img_path: Path, default_year: int) -> tuple[list[dict], str]:
+    """
+    Extract transactions from an IMAGE statement (JPG/PNG).
+    Uses Tesseract's native block/paragraph/line grouping (more robust than y-bucketing
+    for multi-column layouts like CIBC Costco MC).
+    Returns (transactions, reconstructed_text).
+    """
+    try:
+        lines = _ocr_image_to_lines(img_path)
+    except Exception:
+        return [], ""
+
+    debug_text = "\n".join(lines)
+
+    # First pass: direct parse
+    results = []
+    for line in lines:
+        tx = _line_to_tx(line, default_year)
+        if tx:
+            results.append(tx)
+
+    # Second pass: merge fragmented lines (date on one line, amount on the next)
+    if len(results) < 3:
+        results = _merge_fragmented_lines(lines, default_year)
+
+    # Third pass: look-back date assignment for vendor+amount lines that have no date.
+    # These appear when the date column falls in a different Tesseract block (tilted photos).
+    DATELESS_AMT_RE = re.compile(r"([\d,]+\.\d{1,2})\s*$")
+    NO_DATE_RE = re.compile(r"^[A-Za-z]{3,}")  # starts with a vendor name (≥3 alpha), not a date
+    seen_amounts = {round(r["amount_gross"], 2) for r in results}
+    last_date = None
+    for line in lines:
+        if not line.strip():
+            continue
+        # Track the last date seen in ANY line
+        for pat in [
+            re.compile(r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s*\d{1,2}", re.I),
+        ]:
+            dm = pat.search(line)
+            if dm:
+                rd = dm.group(0).strip()
+                # Add year if missing
+                if not re.search(r"\d{4}", rd):
+                    rd = f"{rd} {default_year}"
+                candidate_date = _parse_date(rd)
+                if candidate_date:
+                    last_date = candidate_date
+                    break
+
+        if not last_date:
+            continue
+
+        # Strip trailing punctuation before amount check (same as _line_to_tx does)
+        stripped_line = re.sub(r"([0-9])[.\s]+$", r"\1", line).strip()
+        # Check if it's a dateless vendor+amount line
+        amt_m = DATELESS_AMT_RE.search(stripped_line)
+        if not amt_m or not NO_DATE_RE.match(re.sub(r"^[^A-Za-z0-9]+", "", stripped_line)):
+            continue
+        amount = _parse_amount(amt_m.group(1))
+        # Skip amounts that are clearly credit-limit / balance figures (>= $10,000),
+        # not individual transactions.  Legitimate large single charges are rare in
+        # OCR-from-photo paths and would typically come from a digital PDF instead.
+        if not amount or amount <= 0 or amount >= 10000 or round(amount, 2) in seen_amounts:
+            continue
+
+        # Try parsing with injected date (use stripped_line so trailing "." doesn't block)
+        synthetic = f"{last_date} {stripped_line}"
+        tx = _line_to_tx(synthetic, default_year)
+        if tx:
+            results.append(tx)
+            seen_amounts.add(round(tx["amount_gross"], 2))
+
+    return results, debug_text
+
+
+def _merge_fragmented_lines(lines: list[str], default_year: int) -> list[dict]:
+    """
+    Handle OCR output where a transaction's date/vendor and amount are split across
+    adjacent lines (common for tilted photos of multi-column statements).
+    For each line with a recognisable date but no amount, look ahead up to 4 lines.
+    """
+    MONTH_RE = re.compile(
+        r"^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2}", re.I
+    )
+    AMT_RE = re.compile(r"[\d,]+\.\d{1,2}\s*(?:CR)?\s*$")
+
+    results: list[dict] = []
+    used: set[int] = set()
+    i = 0
+    while i < len(lines):
+        if i in used:
+            i += 1
+            continue
+
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+
+        # Try direct parse first
+        tx = _line_to_tx(line, default_year)
+        if tx:
+            results.append(tx)
+            used.add(i)
+            i += 1
+            continue
+
+        # If line has a date but no amount, try merging with subsequent lines
+        if MONTH_RE.match(line) and not AMT_RE.search(line):
+            for lookahead in range(1, 5):
+                j = i + lookahead
+                if j >= len(lines) or j in used:
+                    continue
+                candidate = (line + " " + lines[j].strip()).strip()
+                tx = _line_to_tx(candidate, default_year)
+                if tx:
+                    results.append(tx)
+                    used.add(i)
+                    used.add(j)
+                    i = j + 1
+                    break
+            else:
+                i += 1
+        else:
+            i += 1
+
     return results
 
 
@@ -468,17 +662,21 @@ def parse_statement_file(
     rows: list[dict] = []
     debug_text = ""
     try:
-        # 1. Try pdfplumber table extraction (PDFs with explicit table borders)
         if suffix.lower() == ".pdf":
+            # 1a. pdfplumber table extraction (PDFs with explicit table borders)
             rows = _extract_via_tables(tmp_path, default_year)
 
-        # 2. Try word-position extraction (handles Capital One / Costco MC multi-column layout)
-        if not rows and suffix.lower() == ".pdf":
-            rows, debug_text = _extract_via_words(tmp_path, default_year)
+            # 1b. Word-position extraction (Capital One / Costco MC multi-column PDF)
+            if not rows:
+                rows, debug_text = _extract_via_words(tmp_path, default_year)
 
-        # 3. Fall back to full OCR text parsing (scanned PDFs and images)
+        elif suffix.lower() in {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp"}:
+            # 2. Word-position extraction for image-based statements (phone photos)
+            rows, debug_text = _extract_via_image_words(tmp_path, default_year)
+
+        # 3. Fallback: full OCR text → line parser (works for simpler layouts)
         if not rows:
-            text = extract_text(tmp_path)
+            text = extract_text(tmp_path, is_statement=True)
             debug_text = text
             if not text.strip():
                 raise ValueError(
@@ -511,6 +709,61 @@ def import_statement(
 ) -> dict:
     """Parse a statement PDF/image and persist transactions. Same return shape as import_csv."""
     df = parse_statement_file(source, filename, default_year)
+
+    new_count = 0
+    for _, row in df.iterrows():
+        tx_id = make_tx_id(row["date"], row["vendor"], row["amount_gross"])
+        cra_line, cra_desc = auto_categorize(row["vendor"])
+        gst_hst    = estimate_tax(row["amount_gross"], province)
+        amount_net = calculate_net(row["amount_gross"], gst_hst)
+        flags      = check_audit_flags(
+            vendor=row["vendor"], amount_gross=row["amount_gross"],
+            cra_line=cra_line, business_percentage=1.0, raw_text="",
+        )
+        upsert_transaction({
+            "transaction_id": tx_id,
+            "date": row["date"],
+            "vendor": row["vendor"],
+            "amount_gross": row["amount_gross"],
+            "amount_net": amount_net,
+            "gst_hst_amount": gst_hst,
+            "is_business": True,
+            "business_percentage": 1.0,
+            "cra_line": cra_line,
+            "cra_description": cra_desc,
+            "receipt_path": None,
+            "raw_receipt_text": None,
+            "audit_flags": flags,
+            "verified_status": False,
+            "notes": "",
+            "import_source": filename,
+        })
+        new_count += 1
+
+    return {
+        "total_rows": len(df),
+        "new_records": new_count,
+        "skipped": 0,
+        "filename": filename,
+        "preview": df.head(10).to_dict("records"),
+    }
+
+
+def import_statement_rows(
+    rows: list[dict],
+    filename: str = "statement",
+    province: str = DEFAULT_PROVINCE,
+) -> dict:
+    """
+    Persist pre-parsed transaction rows (from Vision LLM) to the database.
+    Each row must have: date (YYYY-MM-DD), vendor (str), amount_gross (float).
+    Returns the same shape as import_statement().
+    """
+    if not rows:
+        return {"total_rows": 0, "new_records": 0, "skipped": 0,
+                "filename": filename, "preview": []}
+
+    df = pd.DataFrame(rows).drop_duplicates(subset=["date", "vendor", "amount_gross"])
 
     new_count = 0
     for _, row in df.iterrows():
