@@ -31,6 +31,39 @@ except ImportError:
     _TESSERACT = False
 
 
+# ---------------------------------------------------------------------------
+# Build Tesseract language string from what's actually installed
+# ---------------------------------------------------------------------------
+
+def _build_lang_string() -> str:
+    """
+    Return the best available Tesseract language string.
+    Always includes English; adds Simplified and Traditional Chinese when
+    their traineddata files are present in the Tesseract tessdata directory.
+    """
+    if not _TESSERACT:
+        return "eng"
+
+    # Locate tessdata directory (sibling of the tesseract executable)
+    tess_exe = Path(TESSERACT_PATH)
+    tessdata = tess_exe.parent / "tessdata"
+
+    langs = ["eng"]
+    for lang_code in ("chi_sim", "chi_tra"):
+        if (tessdata / f"{lang_code}.traineddata").exists():
+            langs.append(lang_code)
+
+    return "+".join(langs)
+
+
+_OCR_LANG: str = _build_lang_string()
+_HAS_CHINESE: bool = "chi_sim" in _OCR_LANG or "chi_tra" in _OCR_LANG
+
+
+# ---------------------------------------------------------------------------
+# Public extraction API
+# ---------------------------------------------------------------------------
+
 def extract_text(file_path: str | Path) -> str:
     """Extract text from a PDF or image file. Returns empty string on failure."""
     path = Path(file_path)
@@ -65,17 +98,16 @@ def _extract_pdf_text(path: Path) -> str:
 
 
 def _ocr_pdf_page(path: Path) -> str:
-    """Render first PDF page via PyMuPDF and run Tesseract OCR."""
+    """Render first PDF page via PyMuPDF then run multi-language Tesseract OCR."""
     if not (_FITZ and _TESSERACT):
         return ""
     try:
         doc = fitz.open(str(path))
         page = doc[0]
-        mat = fitz.Matrix(2.0, 2.0)  # 2x scale for better OCR quality
+        mat = fitz.Matrix(2.0, 2.0)  # 2x scale improves OCR quality
         pix = page.get_pixmap(matrix=mat)
-        img_bytes = pix.tobytes("png")
-        img = Image.open(io.BytesIO(img_bytes))
-        return pytesseract.image_to_string(img, lang="eng")
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        return pytesseract.image_to_string(img, lang=_OCR_LANG)
     except Exception:
         return ""
 
@@ -85,7 +117,7 @@ def _ocr_image(path: Path) -> str:
         return ""
     try:
         img = Image.open(str(path))
-        return pytesseract.image_to_string(img, lang="eng")
+        return pytesseract.image_to_string(img, lang=_OCR_LANG)
     except Exception:
         return ""
 
@@ -115,9 +147,11 @@ def find_receipt_files(receipts_dir: str | Path) -> list[Path]:
     ]
 
 
-def ocr_capabilities() -> dict[str, bool]:
+def ocr_capabilities() -> dict:
     return {
         "pdfplumber": _PDFPLUMBER,
         "pymupdf": _FITZ,
         "tesseract": _TESSERACT,
+        "chinese": _HAS_CHINESE,
+        "ocr_lang": _OCR_LANG,
     }

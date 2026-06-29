@@ -84,6 +84,9 @@ rows = [
      "`pip install PyMuPDF`"),
     ("Tesseract OCR", caps["tesseract"], "Image & scanned receipt OCR",
      "Install [Tesseract](https://github.com/UB-Mannheim/tesseract/wiki) then set `TESSERACT_PATH`"),
+    ("Chinese OCR (chi_sim / chi_tra)", caps["chinese"],
+     "Simplified & Traditional Chinese receipt text",
+     "In Tesseract installer → Additional language data, tick **Chinese (Simplified)** and **Chinese (Traditional)**"),
 ]
 
 for name, ok, purpose, fix in rows:
@@ -92,6 +95,9 @@ for name, ok, purpose, fix in rows:
     c2.caption(purpose)
     if not ok:
         c3.caption(f"To enable: {fix}")
+
+if caps["tesseract"]:
+    st.caption(f"Active OCR language string: `{caps['ocr_lang']}`")
 
 st.divider()
 
