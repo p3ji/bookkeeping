@@ -7,7 +7,7 @@ import streamlit as st
 st.set_page_config(page_title="Import", page_icon="📥", layout="wide")
 
 from core.database import init_db, get_setting
-from core.ingestion import import_csv
+from core.ingestion import import_csv, import_statement
 from core.matching import index_receipts, match_all_transactions
 from core.ocr import ocr_capabilities
 from config import IMPORTS_DIR, RECEIPTS_DIR
@@ -25,7 +25,9 @@ ocr = ocr_capabilities()
 st.header("1. Credit Card Statement")
 st.caption("Upload a Costco Mastercard (Capital One) CSV export, or drop the file into the `imports/` folder.")
 
-tab_upload, tab_folder = st.tabs(["Upload File", "From imports/ Folder"])
+tab_upload, tab_folder, tab_statement = st.tabs(
+    ["Upload CSV", "From imports/ Folder", "Statement PDF / Image"]
+)
 
 with tab_upload:
     uploaded = st.file_uploader(
@@ -61,6 +63,51 @@ with tab_folder:
                     )
                 except Exception as e:
                     st.error(f"Import failed: {e}", icon="🚨")
+
+with tab_statement:
+    st.markdown(
+        "Upload a credit card statement as a **PDF, JPEG, or PNG**. "
+        "The app will OCR it and extract individual transactions automatically. "
+        "Works on downloaded PDF statements and phone photos of paper statements."
+    )
+    if not ocr["pdfplumber"] and not ocr["tesseract"]:
+        st.error("No OCR libraries available. Install pdfplumber and/or Tesseract.", icon="🚨")
+    else:
+        stmt_file = st.file_uploader(
+            "Upload statement",
+            type=["pdf", "jpg", "jpeg", "png", "tif", "tiff"],
+            key="stmt_upload",
+        )
+        from datetime import date as _today
+        stmt_year = st.number_input(
+            "Statement year (if not printed on statement)",
+            min_value=2015, max_value=_today.today().year + 1,
+            value=_today.today().year,
+            step=1,
+        )
+        if stmt_file and st.button("Parse & Import Statement", key="btn_stmt", type="primary"):
+            with st.spinner("Extracting transactions via OCR — this may take a moment…"):
+                try:
+                    result = import_statement(
+                        stmt_file.read(),
+                        filename=stmt_file.name,
+                        province=province,
+                        default_year=int(stmt_year),
+                    )
+                    st.success(
+                        f"Imported **{result['new_records']}** transactions "
+                        f"from `{stmt_file.name}` ({result['total_rows']} found).",
+                        icon="✅",
+                    )
+                    if result.get("preview"):
+                        st.markdown("**Preview (first 10):**")
+                        st.dataframe(result["preview"], hide_index=True)
+                except Exception as e:
+                    st.error(f"Statement parsing failed: {e}", icon="🚨")
+                    st.caption(
+                        "Tip: If this is a scanned/photographed statement, ensure Tesseract is installed. "
+                        "For best results, export your statement as CSV from the bank portal."
+                    )
 
 st.divider()
 

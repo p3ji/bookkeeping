@@ -20,10 +20,6 @@ st.header("Business Information")
 with st.form("settings_form"):
     col1, col2 = st.columns(2)
     with col1:
-        business_name = st.text_input(
-            "Business / Trading Name",
-            value=get_setting("business_name", "My Business"),
-        )
         province = st.selectbox(
             "Province / Territory",
             options=list(TAX_RATES.keys()),
@@ -31,11 +27,6 @@ with st.form("settings_form"):
             format_func=lambda p: f"{p} — {TAX_RATES[p]['name']} ({TAX_RATES[p]['rate']*100:.0f}%)",
         )
     with col2:
-        business_number = st.text_input(
-            "CRA Business Number (optional)",
-            value=get_setting("business_number", ""),
-            placeholder="123456789RT0001",
-        )
         fiscal_month = st.selectbox(
             "Fiscal Year Start Month",
             options=list(range(1, 13)),
@@ -47,9 +38,7 @@ with st.form("settings_form"):
         )
 
     if st.form_submit_button("💾 Save Settings", type="primary"):
-        save_setting("business_name", business_name)
         save_setting("province", province)
-        save_setting("business_number", business_number)
         save_setting("fiscal_year_start", str(fiscal_month))
         st.success("Settings saved.", icon="✅")
         st.rerun()

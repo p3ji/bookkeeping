@@ -182,7 +182,7 @@ def update_transaction(transaction_id: str, updates: dict):
                 notes               = ?,
                 amount_net          = ?,
                 gst_hst_amount      = ?,
-                updated_at          = current_timestamp
+                updated_at          = now()
             WHERE transaction_id = ?
             """,
             [
@@ -220,7 +220,7 @@ def upsert_receipt_index(receipt: dict):
                 amount_extracted = excluded.amount_extracted,
                 vendor_extracted = excluded.vendor_extracted,
                 raw_text         = excluded.raw_text,
-                indexed_at       = current_timestamp
+                indexed_at       = now()
             """,
             [
                 receipt["receipt_id"], receipt["file_path"],

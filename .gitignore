@@ -1,4 +1,8 @@
+imports/
+receipts/
 data/
+exports/*.md
+exports/*.csv
 *.duckdb
 *.db
 __pycache__/
