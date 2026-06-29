@@ -23,12 +23,17 @@ except ImportError:
 
 try:
     import pytesseract
-    from PIL import Image
+    from PIL import Image, ImageEnhance, ImageFilter
     if os.path.exists(TESSERACT_PATH):
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
     _TESSERACT = True
 except ImportError:
     _TESSERACT = False
+
+# Tesseract config: PSM 6 = uniform block of text, OEM 1 = LSTM only (best accuracy)
+_TESS_CONFIG = "--psm 6 --oem 1"
+# Minimum image width before upscaling — small images degrade OCR accuracy
+_MIN_WIDTH_PX = 1200
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +102,18 @@ def _extract_pdf_text(path: Path) -> str:
         return ""
 
 
+def _preprocess(img: "Image.Image") -> "Image.Image":
+    """Greyscale → upscale if small → contrast → sharpen for better OCR accuracy."""
+    img = img.convert("L")  # greyscale
+    w, h = img.size
+    if w < _MIN_WIDTH_PX:
+        scale = _MIN_WIDTH_PX / w
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    img = ImageEnhance.Contrast(img).enhance(2.0)
+    img = img.filter(ImageFilter.SHARPEN)
+    return img
+
+
 def _ocr_pdf_page(path: Path) -> str:
     """Render first PDF page via PyMuPDF then run multi-language Tesseract OCR."""
     if not (_FITZ and _TESSERACT):
@@ -104,10 +121,11 @@ def _ocr_pdf_page(path: Path) -> str:
     try:
         doc = fitz.open(str(path))
         page = doc[0]
-        mat = fitz.Matrix(2.0, 2.0)  # 2x scale improves OCR quality
+        mat = fitz.Matrix(3.0, 3.0)  # 3x ≈ 216 DPI — better for small Chinese characters
         pix = page.get_pixmap(matrix=mat)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
-        return pytesseract.image_to_string(img, lang=_OCR_LANG)
+        img = _preprocess(img)
+        return pytesseract.image_to_string(img, lang=_OCR_LANG, config=_TESS_CONFIG)
     except Exception:
         return ""
 
@@ -117,7 +135,8 @@ def _ocr_image(path: Path) -> str:
         return ""
     try:
         img = Image.open(str(path))
-        return pytesseract.image_to_string(img, lang=_OCR_LANG)
+        img = _preprocess(img)
+        return pytesseract.image_to_string(img, lang=_OCR_LANG, config=_TESS_CONFIG)
     except Exception:
         return ""
 
