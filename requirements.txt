@@ -1,0 +1,13 @@
+streamlit>=1.35.0
+duckdb>=0.10.0
+pandas>=2.0.0
+pdfplumber>=0.10.0
+PyMuPDF>=1.23.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
+python-dateutil>=2.8.2
+thefuzz>=0.20.0
+python-Levenshtein>=0.21.0
+plotly>=5.18.0
+openpyxl>=3.1.2
+numpy>=1.24.0
