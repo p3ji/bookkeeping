@@ -103,7 +103,14 @@ with tab_statement:
                         st.markdown("**Preview (first 10):**")
                         st.dataframe(result["preview"], hide_index=True)
                 except Exception as e:
-                    st.error(f"Statement parsing failed: {e}", icon="🚨")
+                    msg = str(e)
+                    if "\n\nRaw extracted text" in msg:
+                        headline, _, raw = msg.partition("\n\nRaw extracted text")
+                        st.error(headline, icon="🚨")
+                        with st.expander("🔍 Raw extracted text (debug)"):
+                            st.text(raw.replace("(first 3000 chars):\n", ""))
+                    else:
+                        st.error(f"Statement parsing failed: {msg}", icon="🚨")
                     st.caption(
                         "Tip: If this is a scanned/photographed statement, ensure Tesseract is installed. "
                         "For best results, export your statement as CSV from the bank portal."

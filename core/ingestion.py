@@ -353,7 +353,7 @@ def _line_to_tx(line: str, default_year: int) -> dict | None:
 
 
 def _extract_via_tables(pdf_path: Path, default_year: int) -> list[dict]:
-    """Use pdfplumber table extractor — works well on digital PDFs."""
+    """Use pdfplumber table extractor — works well on digital PDFs with explicit table borders."""
     try:
         import pdfplumber
     except ImportError:
@@ -396,6 +396,46 @@ def _extract_via_tables(pdf_path: Path, default_year: int) -> list[dict]:
     return results
 
 
+def _extract_via_words(pdf_path: Path, default_year: int) -> tuple[list[dict], str]:
+    """
+    Reconstruct lines from word bounding-boxes — handles multi-column PDFs like
+    Capital One / Costco Mastercard where text is positioned but not in HTML tables.
+    Returns (transactions, reconstructed_text) so callers can show debug info.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return [], ""
+
+    results: list[dict] = []
+    all_lines: list[str] = []
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words(x_tolerance=3, y_tolerance=3,
+                                           keep_blank_chars=False)
+                if not words:
+                    continue
+
+                # Group words by y-coordinate bucket (3 pt tolerance → same line)
+                lines_by_y: dict[int, list] = {}
+                for w in words:
+                    y_key = round(float(w["top"]) / 3) * 3
+                    lines_by_y.setdefault(y_key, []).append(w)
+
+                for y_key in sorted(lines_by_y):
+                    sorted_words = sorted(lines_by_y[y_key], key=lambda w: float(w["x0"]))
+                    line_text = " ".join(w["text"] for w in sorted_words)
+                    all_lines.append(line_text)
+                    tx = _line_to_tx(line_text, default_year)
+                    if tx:
+                        results.append(tx)
+    except Exception:
+        pass
+
+    return results, "\n".join(all_lines)
+
+
 def parse_statement_file(
     source,
     filename: str = "statement",
@@ -426,14 +466,20 @@ def parse_statement_file(
         tmp_path = Path(tmp.name)
 
     rows: list[dict] = []
+    debug_text = ""
     try:
-        # 1. Try pdfplumber table extraction (best for digital PDFs)
+        # 1. Try pdfplumber table extraction (PDFs with explicit table borders)
         if suffix.lower() == ".pdf":
             rows = _extract_via_tables(tmp_path, default_year)
 
-        # 2. Fall back to full OCR text parsing
+        # 2. Try word-position extraction (handles Capital One / Costco MC multi-column layout)
+        if not rows and suffix.lower() == ".pdf":
+            rows, debug_text = _extract_via_words(tmp_path, default_year)
+
+        # 3. Fall back to full OCR text parsing (scanned PDFs and images)
         if not rows:
             text = extract_text(tmp_path)
+            debug_text = text
             if not text.strip():
                 raise ValueError(
                     "No text could be extracted. Ensure Tesseract is installed "
@@ -448,8 +494,9 @@ def parse_statement_file(
 
     if not rows:
         raise ValueError(
-            "No transactions found in statement. "
-            "The layout may not be supported — try exporting as CSV instead."
+            "No transactions found in statement.\n\n"
+            "Raw extracted text (first 3000 chars):\n"
+            + (debug_text[:3000] if debug_text else "(nothing extracted)")
         )
 
     df = pd.DataFrame(rows).drop_duplicates(subset=["date", "vendor", "amount_gross"])
