@@ -9,7 +9,7 @@ st.set_page_config(page_title="Triage", page_icon="🔍", layout="wide")
 
 from core.database import (
     init_db, get_all_transactions, get_transaction, update_transaction,
-    get_setting,
+    get_setting, get_summary_stats,
 )
 from core.audit import check_audit_flags
 from core.tax import calculate_net, calculate_deductible
@@ -23,6 +23,14 @@ init_db()
 st.title("🔍 Triage Inbox")
 
 province = get_setting("province", "ON")
+
+stats = get_summary_stats()
+unverified_count = stats["total"] - stats["verified"]
+if unverified_count > 0:
+    st.info(
+        f"📋 You have **{unverified_count}** unverified transactions totaling "
+        f"**${stats['unverified_total']:,.2f}** waiting for triage."
+    )
 
 # ---------------------------------------------------------------------------
 # Sidebar filters
@@ -130,19 +138,39 @@ with col_receipt:
     if receipt_path and Path(receipt_path).exists():
         rp = Path(receipt_path)
         st.markdown(f"**Receipt:** `{rp.name}`")
-        if rp.suffix.lower() == ".pdf":
-            img_bytes = render_pdf_preview(rp)
-            if img_bytes:
-                st.image(img_bytes, use_container_width=True)
+        # Document rendering with highlighted extraction bounding boxes
+        from core.ocr import draw_highlights_on_image
+        
+        vendor_val = tx.get("vendor", "")
+        date_val = str(tx.get("date") or "")
+        try:
+            total_val = float(tx.get("amount_gross") or 0.0)
+        except ValueError:
+            total_val = None
+        try:
+            tax_val = float(tx.get("gst_hst_amount") or 0.0)
+        except ValueError:
+            tax_val = None
+            
+        img_bytes = draw_highlights_on_image(
+            rp, 
+            vendor=vendor_val, 
+            date=date_val, 
+            total=total_val, 
+            tax=tax_val
+        )
+        
+        # Fallback to standard preview if drawing highlights returned None
+        if not img_bytes:
+            if rp.suffix.lower() == ".pdf":
+                img_bytes = render_pdf_preview(rp)
             else:
-                st.warning("PDF preview unavailable (PyMuPDF not installed).")
+                img_bytes = render_image_preview(rp)
+                
+        if img_bytes:
+            st.image(img_bytes, use_container_width=True)
         else:
-            # Use EXIF-corrected preview so phone photos show right-side up
-            img_bytes = render_image_preview(rp)
-            if img_bytes:
-                st.image(img_bytes, use_container_width=True)
-            else:
-                st.image(str(rp), use_container_width=True)
+            st.image(str(rp), use_container_width=True)
 
         # Show structured data extracted from receipt
         raw_text = tx.get("raw_receipt_text") or ""
@@ -170,6 +198,64 @@ with col_receipt:
                     st.write(f"**Line items:** {len(data.line_items)}")
                     st.dataframe(data.line_items, hide_index=True,
                                  use_container_width=True)
+            
+            # Show side-by-side extraction methods comparison
+            extraction_details = tx.get("extraction_details")
+            if isinstance(extraction_details, str):
+                try:
+                    extraction_details = json.loads(extraction_details)
+                except Exception:
+                    extraction_details = {}
+            if extraction_details and isinstance(extraction_details, dict) and len(extraction_details) > 0:
+                with st.expander("🔍 Compare Extraction Methods"):
+                    from core.extraction import METHOD_LABELS
+                    from core.receipt_parser import ReceiptData
+                    
+                    comp_rows = []
+                    for field_name in ["vendor", "date", "total", "tax"]:
+                        row_dict = {"Field": field_name.capitalize()}
+                        for m in ["deterministic", "ollama", "cloud", "gemini", "playwright"]:
+                            m_data = extraction_details.get(m)
+                            if not m_data:
+                                row_dict[METHOD_LABELS.get(m, m)] = "—"
+                                continue
+                            
+                            # Resolve value
+                            if m == "playwright":
+                                val = m_data.get(field_name) if isinstance(m_data, dict) else getattr(m_data, field_name, "—")
+                            elif isinstance(m_data, dict):
+                                val = m_data.get(field_name, "—")
+                            else:
+                                val = getattr(m_data, field_name, "—")
+                                
+                            if field_name == "total" or field_name == "tax":
+                                if field_name == "tax":
+                                    if isinstance(m_data, dict):
+                                        val = (m_data.get("tax_hst") or 0.0) + (m_data.get("tax_gst") or 0.0) or (m_data.get("hst") or 0.0) + (m_data.get("gst") or 0.0)
+                                    else:
+                                        val = (getattr(m_data, "tax_hst", 0.0) or 0.0) + (getattr(m_data, "tax_gst", 0.0) or 0.0)
+                                try:
+                                    if val is not None and val != "—":
+                                        row_dict[METHOD_LABELS.get(m, m)] = f"${float(val):,.2f}"
+                                    else:
+                                        row_dict[METHOD_LABELS.get(m, m)] = "—"
+                                except ValueError:
+                                    row_dict[METHOD_LABELS.get(m, m)] = str(val)
+                            else:
+                                row_dict[METHOD_LABELS.get(m, m)] = str(val) if val is not None else "—"
+                        
+                        # Reconciled value from current transaction
+                        if field_name == "vendor":
+                            row_dict["Reconciled (Final)"] = tx.get("vendor", "—")
+                        elif field_name == "date":
+                            row_dict["Reconciled (Final)"] = str(tx.get("date") or "—")
+                        elif field_name == "total":
+                            row_dict["Reconciled (Final)"] = f"${float(tx.get('amount_gross', 0.0)):,.2f}"
+                        elif field_name == "tax":
+                            row_dict["Reconciled (Final)"] = f"${float(tx.get('gst_hst_amount', 0.0)):,.2f}"
+                            
+                        comp_rows.append(row_dict)
+                    st.table(pd.DataFrame(comp_rows))
     else:
         st.markdown("**No receipt matched.**")
         with st.expander("📎 Attach receipt manually"):

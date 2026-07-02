@@ -39,8 +39,25 @@ def _encode_image(path: Path) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
+def is_ollama_server_running() -> bool:
+    """Instantly check if the Ollama local server port 11434 is listening."""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", 11434), timeout=0.15):
+            return True
+    except Exception:
+        return False
+
+
 def is_ollama_available() -> bool:
     """Return True if the Ollama server is running and has a vision model."""
+    from core.database import get_setting
+    if get_setting("ollama_enabled", "true") == "false":
+        return False
+
+    if not is_ollama_server_running():
+        return False
+
     global _OLLAMA_OK
     if _OLLAMA_OK is not None:
         return _OLLAMA_OK
@@ -57,6 +74,8 @@ def is_ollama_available() -> bool:
 
 def ollama_vision_model() -> Optional[str]:
     """Return the name of the first available vision model, or None."""
+    if not is_ollama_server_running():
+        return None
     try:
         import ollama
         models = [m.model for m in ollama.list().models]
@@ -298,6 +317,100 @@ def extract_receipt_data_llm_cloud(image_path: str | Path) -> dict:
         if not json_match:
             return {}
         return json.loads(json_match.group(0))
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Cloud LLM (Google Gemini) — opt-in
+# ---------------------------------------------------------------------------
+
+def is_gemini_available() -> bool:
+    """Return True if the GEMINI_API_KEY environment variable is set."""
+    return bool(os.environ.get("GEMINI_API_KEY"))
+
+
+def _gemini_vision_call(prompt: str, img_b64: str) -> str:
+    """Send an image + prompt to the Gemini API and return its JSON text response."""
+    import requests
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        return ""
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inlineData": {
+                    "mimeType": "image/jpeg",
+                    "data": img_b64
+                }}
+            ]
+        }],
+        "generationConfig": {
+            "responseMimeType": "application/json"
+        }
+    }
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        res_json = response.json()
+        return res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception:
+        return ""
+
+
+def extract_statement_transactions_gemini(
+    image_path: str | Path,
+    default_year: int,
+) -> list[dict]:
+    """Gemini equivalent of extract_statement_transactions(). [] on failure."""
+    path = Path(image_path)
+    if not path.exists() or not is_gemini_available():
+        return []
+
+    try:
+        img_b64 = _encode_image(path)
+        raw = _gemini_vision_call(_STATEMENT_PROMPT, img_b64)
+        if not raw:
+            return []
+        
+        rows = json.loads(raw)
+        results = []
+        for row in rows:
+            try:
+                import pandas as pd
+                date_str = pd.to_datetime(str(row.get("date", "")), dayfirst=False).strftime("%Y-%m-%d")
+                amount = float(row.get("amount", 0))
+                vendor = str(row.get("vendor", "")).strip()
+                if date_str and amount > 0 and vendor:
+                    results.append({
+                        "date": date_str,
+                        "vendor": vendor,
+                        "amount_gross": round(amount, 2),
+                    })
+            except Exception:
+                continue
+        return results
+    except Exception:
+        return []
+
+
+def extract_receipt_data_llm_gemini(image_path: str | Path) -> dict:
+    """Gemini equivalent of extract_receipt_data_llm(). {} on failure."""
+    path = Path(image_path)
+    if not path.exists() or not is_gemini_available():
+        return {}
+
+    try:
+        img_b64 = _encode_image(path)
+        raw = _gemini_vision_call(_RECEIPT_PROMPT, img_b64)
+        if not raw:
+            return {}
+        return json.loads(raw)
     except Exception:
         return {}
 

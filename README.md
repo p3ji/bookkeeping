@@ -34,7 +34,7 @@ Or double-click `run.bat`.
 
 ### Import your statement
 1. Export your Costco Mastercard CSV from the Capital One portal
-2. Go to **Import** page → upload the CSV or drop it in `imports/`
+2. Go to **Import** page → upload the CSV or drop it in `statements/`
 3. Click **Import Statement**
 
 ### Add receipts (optional but recommended)
@@ -113,11 +113,12 @@ bookkeeping/
 │   ├── audit.py         ← Audit risk flagging
 │   └── export.py        ← Markdown sync export
 ├── pages/
-│   ├── 1_Import.py      ← CSV + receipt ingestion UI
+│   ├── 1_Import.py      ← Universal drop zone + match cards
 │   ├── 2_Triage.py      ← Transaction review UI
-│   ├── 3_Dashboard.py   ← Analytics & charts
-│   └── 4_Settings.py    ← Province, export, OCR status
-├── imports/             ← Drop CSV files here
+│   ├── 3_Reconcile.py   ← Receipt coverage & match audit
+│   ├── 4_Dashboard.py   ← Analytics & charts
+│   └── 5_Settings.py    ← Province, export, OCR status
+├── statements/          ← Drop CSV/PDF files here
 ├── receipts/YYYY/MM/    ← Drop receipt PDFs/images here
 ├── exports/             ← Markdown exports written here
 └── data/                ← DuckDB database (auto-created)

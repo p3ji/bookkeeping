@@ -13,7 +13,7 @@ from config import DEFAULT_PROVINCE
 from core.categorization import auto_categorize
 from core.audit import check_audit_flags
 from core.tax import estimate_tax, calculate_net
-from core.database import upsert_transaction, get_indexed_paths
+from core.database import upsert_transaction, get_indexed_paths, transaction_exists
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +119,19 @@ def _detect_columns(df: pd.DataFrame) -> dict[str, str] | None:
     }
 
 
+def _find_header_row(lines: list[str]) -> int:
+    """Find the first line containing typical header columns."""
+    for idx, line in enumerate(lines[:30]):
+        line_lower = line.lower()
+        # Header must have some indicator of date and description/amount
+        has_date = any(w in line_lower for w in ["date", "datum"])
+        has_desc = any(w in line_lower for w in ["desc", "merchant", "vendor", "payee", "details", "memo"])
+        has_amt = any(w in line_lower for w in ["amount", "debit", "credit", "charge", "withdrawals"])
+        if has_date and (has_desc or has_amt):
+            return idx
+    return 0
+
+
 def parse_csv(source: str | Path | bytes | io.BytesIO) -> pd.DataFrame:
     """
     Parse a credit card CSV statement.
@@ -126,18 +139,41 @@ def parse_csv(source: str | Path | bytes | io.BytesIO) -> pd.DataFrame:
         date, vendor, amount_gross, raw_date, raw_vendor
     Raises ValueError on unrecognised format.
     """
+    skip_rows = 0
+    try:
+        # Read a preview of lines to find where actual headers start
+        if isinstance(source, (str, Path)):
+            with open(source, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [f.readline() for _ in range(30)]
+        else:
+            if hasattr(source, "seek"):
+                source.seek(0)
+                content = source.read()
+                if isinstance(content, bytes):
+                    content = content.decode("utf-8", errors="ignore")
+                lines = content.splitlines()[:30]
+                source.seek(0)
+            else:
+                # bytes
+                content = source.decode("utf-8", errors="ignore")
+                lines = content.splitlines()[:30]
+        
+        skip_rows = _find_header_row(lines)
+    except Exception:
+        pass
+
     if isinstance(source, (str, Path)):
-        raw = pd.read_csv(source, dtype=str, skip_blank_lines=True)
+        raw = pd.read_csv(source, dtype=str, skip_blank_lines=True, skiprows=skip_rows)
     else:
         raw = pd.read_csv(source if hasattr(source, "read") else io.BytesIO(source),
-                          dtype=str, skip_blank_lines=True)
+                          dtype=str, skip_blank_lines=True, skiprows=skip_rows)
 
     raw.columns = [c.strip().strip('"') for c in raw.columns]
     mapping = _detect_columns(raw)
     if mapping is None:
         raise ValueError(
-            "Unrecognised CSV format. Expected columns like 'Date', 'Description', "
-            "'Debit'/'Credit' or 'Amount'."
+            f"Unrecognised CSV format. Columns found: {list(raw.columns)}. "
+            "Expected columns like 'Date', 'Description', 'Debit'/'Credit' or 'Amount'."
         )
 
     rows = []
@@ -202,9 +238,15 @@ def import_csv(
 
     new_count = 0
     skipped = 0
+    detected_sum = float(df["amount_gross"].sum()) if not df.empty else 0.0
+    new_sum = 0.0
 
     for _, row in df.iterrows():
         tx_id = make_tx_id(row["date"], row["vendor"], row["amount_gross"])
+
+        if transaction_exists(tx_id):
+            skipped += 1
+            continue
 
         cra_line, cra_desc = auto_categorize(row["vendor"])
         gst_hst = estimate_tax(row["amount_gross"], province)
@@ -237,12 +279,15 @@ def import_csv(
         }
         upsert_transaction(tx)
         new_count += 1
+        new_sum += float(row["amount_gross"])
 
     return {
         "total_rows": len(df),
         "new_records": new_count,
         "skipped": skipped,
         "filename": filename,
+        "detected_sum": detected_sum,
+        "new_sum": new_sum,
     }
 
 
@@ -745,8 +790,15 @@ def import_statement(
     df = parse_statement_file(source, filename, default_year)
 
     new_count = 0
+    skipped = 0
+    detected_sum = float(df["amount_gross"].sum()) if not df.empty else 0.0
+    new_sum = 0.0
     for _, row in df.iterrows():
         tx_id = make_tx_id(row["date"], row["vendor"], row["amount_gross"])
+        if transaction_exists(tx_id):
+            skipped += 1
+            continue
+
         cra_line, cra_desc = auto_categorize(row["vendor"])
         gst_hst    = estimate_tax(row["amount_gross"], province)
         amount_net = calculate_net(row["amount_gross"], gst_hst)
@@ -773,12 +825,15 @@ def import_statement(
             "import_source": filename,
         })
         new_count += 1
+        new_sum += float(row["amount_gross"])
 
     return {
         "total_rows": len(df),
         "new_records": new_count,
-        "skipped": 0,
+        "skipped": skipped,
         "filename": filename,
+        "detected_sum": detected_sum,
+        "new_sum": new_sum,
         "preview": df.head(10).to_dict("records"),
     }
 
@@ -815,8 +870,15 @@ def import_statement_multi(
 
     new_count = 0
     flagged_count = 0
+    skipped = 0
+    detected_sum = float(df["amount_gross"].sum()) if not df.empty else 0.0
+    new_sum = 0.0
     for _, row in df.iterrows():
         tx_id = make_tx_id(row["date"], row["vendor"], row["amount_gross"])
+        if transaction_exists(tx_id):
+            skipped += 1
+            continue
+
         cra_line, cra_desc = auto_categorize(row["vendor"])
         gst_hst    = estimate_tax(row["amount_gross"], province)
         amount_net = calculate_net(row["amount_gross"], gst_hst)
@@ -856,14 +918,17 @@ def import_statement_multi(
             "extraction_confidence": result.confidence,
         })
         new_count += 1
+        new_sum += float(row["amount_gross"])
 
     return {
         "total_rows": len(df),
         "new_records": new_count,
         "flagged_count": flagged_count,
-        "skipped": 0,
+        "skipped": skipped,
         "filename": filename,
         "method_used": result.method_used,
+        "detected_sum": detected_sum,
+        "new_sum": new_sum,
         "preview": df.drop(columns=["_review_note"], errors="ignore").head(10).to_dict("records"),
     }
 
@@ -885,8 +950,15 @@ def import_statement_rows(
     df = pd.DataFrame(rows).drop_duplicates(subset=["date", "vendor", "amount_gross"])
 
     new_count = 0
+    skipped = 0
+    detected_sum = float(df["amount_gross"].sum()) if not df.empty else 0.0
+    new_sum = 0.0
     for _, row in df.iterrows():
         tx_id = make_tx_id(row["date"], row["vendor"], row["amount_gross"])
+        if transaction_exists(tx_id):
+            skipped += 1
+            continue
+
         cra_line, cra_desc = auto_categorize(row["vendor"])
         gst_hst    = estimate_tax(row["amount_gross"], province)
         amount_net = calculate_net(row["amount_gross"], gst_hst)
@@ -894,6 +966,15 @@ def import_statement_rows(
             vendor=row["vendor"], amount_gross=row["amount_gross"],
             cra_line=cra_line, business_percentage=1.0, raw_text="",
         )
+
+        # Per-row provenance attached by _reconcile_statement_rows (if any)
+        prov = row.get("_by_method")
+        prov = prov if isinstance(prov, dict) else None
+        review_note = row.get("_review_note")
+        review_note = review_note if isinstance(review_note, str) and review_note else None
+        if review_note:
+            flags.append("EXTRACTION MISMATCH: methods disagree, please verify.")
+
         upsert_transaction({
             "transaction_id": tx_id,
             "date": row["date"],
@@ -909,15 +990,19 @@ def import_statement_rows(
             "raw_receipt_text": None,
             "audit_flags": flags,
             "verified_status": False,
-            "notes": "",
+            "notes": f"Extraction review: {review_note}" if review_note else "",
             "import_source": filename,
+            "extraction_details": prov,
         })
         new_count += 1
+        new_sum += float(row["amount_gross"])
 
     return {
         "total_rows": len(df),
         "new_records": new_count,
-        "skipped": 0,
+        "skipped": skipped,
         "filename": filename,
-        "preview": df.head(10).to_dict("records"),
+        "detected_sum": detected_sum,
+        "new_sum": new_sum,
+        "preview": df.drop(columns=["_review_note", "_by_method"], errors="ignore").head(10).to_dict("records"),
     }

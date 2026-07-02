@@ -51,12 +51,13 @@ bookkeeping/
 │   └── export.py           ← Obsidian Markdown export with YAML frontmatter
 │
 ├── pages/
-│   ├── 1_Import.py         ← CSV upload | imports/ folder | Statement PDF/image
+│   ├── 1_Import.py         ← Universal drop zone, match cards, batch import metrics
 │   ├── 2_Triage.py         ← Full-width table + per-transaction classification form
-│   ├── 3_Dashboard.py      ← Monthly bar chart, category pie, summary table
-│   └── 4_Settings.py       ← Province/tax rate, Markdown export, OCR status
+│   ├── 3_Reconcile.py      ← Receipt coverage metrics, missing receipts, match audit
+│   ├── 4_Dashboard.py      ← Monthly bar chart, category pie, summary table
+│   └── 5_Settings.py       ← Province/tax rate, Markdown export, OCR/LLM status
 │
-├── imports/                ← drop CSV or PDF statements here (git-ignored)
+├── statements/             ← drop CSV or PDF statements here (git-ignored)
 ├── receipts/YYYY/MM/       ← drop receipt PDFs/images here (git-ignored)
 ├── exports/                ← verified Markdown records written here (*.md git-ignored)
 └── data/                   ← DuckDB database (git-ignored)
@@ -124,7 +125,7 @@ actual amount is extracted from receipt OCR text.
 | Path | Committed? | Why |
 |---|---|---|
 | `data/` | **No** | Contains the DuckDB database with all financial records |
-| `imports/` | **No** | Contains raw bank statement CSVs/PDFs |
+| `statements/` | **No** | Contains raw bank statement CSVs/PDFs |
 | `receipts/` | **No** | Contains receipt images with personal purchase data |
 | `exports/*.md` | **No** | Generated Markdown contains transaction amounts and vendors |
 | `exports/.gitkeep` | Yes | Preserves the directory in git |
@@ -173,4 +174,4 @@ Or double-click `run.bat` on Windows.
 
 ### Add a new dashboard chart
 - All data comes from `core/database.py` analytics functions
-- Add a new query function there, then use Plotly in `pages/3_Dashboard.py`
+- Add a new query function there, then use Plotly in `pages/4_Dashboard.py`

@@ -1,5 +1,26 @@
 """DuckDB connection, schema management, and CRUD helpers."""
 import json
+
+class DataclassEncoder(json.JSONEncoder):
+    def default(self, o):
+        # Gracefully handle custom ReceiptData dataclass serialization
+        from core.receipt_parser import ReceiptData
+        if isinstance(o, ReceiptData):
+            return {
+                "vendor": o.vendor,
+                "date": o.date,
+                "total": o.total,
+                "subtotal": o.subtotal,
+                "tax_gst": o.tax_gst,
+                "tax_hst": o.tax_hst,
+                "tax_pst": o.tax_pst,
+                "line_items": o.line_items,
+                "doc_type": o.doc_type,
+                "raw_text": o.raw_text
+            }
+        if hasattr(o, "__dict__"):
+            return o.__dict__
+        return super().default(o)
 from contextlib import contextmanager
 
 import duckdb
@@ -78,10 +99,14 @@ def init_db():
                       "extraction_method VARCHAR DEFAULT 'deterministic'")
         conn.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS "
                       "extraction_confidence DECIMAL(5,4)")
+        conn.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS "
+                      "extraction_details TEXT")
         conn.execute("ALTER TABLE receipt_index ADD COLUMN IF NOT EXISTS "
                       "extraction_method VARCHAR DEFAULT 'deterministic'")
         conn.execute("ALTER TABLE receipt_index ADD COLUMN IF NOT EXISTS "
                       "extraction_confidence DECIMAL(5,4)")
+        conn.execute("ALTER TABLE receipt_index ADD COLUMN IF NOT EXISTS "
+                      "extraction_details TEXT")
 
         _defaults = [
             ("province", "ON"),
@@ -145,7 +170,18 @@ def get_transaction(transaction_id: str) -> dict | None:
         return None
     row = result.iloc[0].to_dict()
     row["audit_flags"] = json.loads(row.get("audit_flags") or "[]")
+    row["extraction_details"] = json.loads(row.get("extraction_details") or "{}")
     return row
+
+
+def transaction_exists(transaction_id: str) -> bool:
+    """Check if a transaction exists in the database by its ID."""
+    with db_conn(read_only=True) as conn:
+        r = conn.execute(
+            "SELECT 1 FROM transactions WHERE transaction_id = ?",
+            [transaction_id],
+        ).fetchone()
+        return r is not None
 
 
 def upsert_transaction(tx: dict):
@@ -159,8 +195,8 @@ def upsert_transaction(tx: dict):
                 gst_hst_amount, is_business, business_percentage, cra_line,
                 cra_description, receipt_path, raw_receipt_text, audit_flags,
                 verified_status, notes, import_source,
-                extraction_method, extraction_confidence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                extraction_method, extraction_confidence, extraction_details
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (transaction_id) DO NOTHING
             """,
             [
@@ -172,6 +208,7 @@ def upsert_transaction(tx: dict):
                 tx.get("verified_status", False), tx.get("notes", ""),
                 tx.get("import_source"),
                 tx.get("extraction_method", "deterministic"), tx.get("extraction_confidence"),
+                json.dumps(tx.get("extraction_details", {}), cls=DataclassEncoder) if isinstance(tx.get("extraction_details"), dict) else tx.get("extraction_details"),
             ],
         )
         conn.commit()
@@ -227,8 +264,8 @@ def upsert_receipt_index(receipt: dict):
             INSERT INTO receipt_index (
                 receipt_id, file_path, file_modified, date_extracted,
                 amount_extracted, vendor_extracted, raw_text,
-                extraction_method, extraction_confidence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                extraction_method, extraction_confidence, extraction_details
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (file_path) DO UPDATE SET
                 date_extracted        = excluded.date_extracted,
                 amount_extracted      = excluded.amount_extracted,
@@ -236,6 +273,7 @@ def upsert_receipt_index(receipt: dict):
                 raw_text              = excluded.raw_text,
                 extraction_method     = excluded.extraction_method,
                 extraction_confidence = excluded.extraction_confidence,
+                extraction_details    = excluded.extraction_details,
                 indexed_at            = now()
             """,
             [
@@ -244,6 +282,7 @@ def upsert_receipt_index(receipt: dict):
                 receipt.get("amount_extracted"), receipt.get("vendor_extracted"),
                 receipt.get("raw_text"),
                 receipt.get("extraction_method", "deterministic"), receipt.get("extraction_confidence"),
+                json.dumps(receipt.get("extraction_details", {}), cls=DataclassEncoder) if isinstance(receipt.get("extraction_details"), dict) else receipt.get("extraction_details"),
             ],
         )
         conn.commit()
@@ -282,7 +321,8 @@ def get_summary_stats() -> dict:
                     SUM(CASE WHEN is_business AND verified_status
                              THEN COALESCE(gst_hst_amount,0) * business_percentage
                              ELSE 0 END)                                              AS itc_total,
-                    SUM(CASE WHEN receipt_path IS NULL THEN 1 ELSE 0 END)            AS missing_receipts
+                    SUM(CASE WHEN receipt_path IS NULL THEN 1 ELSE 0 END)            AS missing_receipts,
+                    SUM(CASE WHEN NOT verified_status THEN amount_gross ELSE 0 END)  AS unverified_total
                 FROM transactions
             """).fetchone()
             return {
@@ -291,10 +331,11 @@ def get_summary_stats() -> dict:
                 "business_total": float(r[2] or 0),
                 "itc_total": float(r[3] or 0),
                 "missing_receipts": int(r[4] or 0),
+                "unverified_total": float(r[5] or 0.0),
             }
         except Exception:
             return {"total": 0, "verified": 0, "business_total": 0.0,
-                    "itc_total": 0.0, "missing_receipts": 0}
+                    "itc_total": 0.0, "missing_receipts": 0, "unverified_total": 0.0}
 
 
 def get_monthly_summary(year: int) -> pd.DataFrame:
@@ -383,4 +424,41 @@ def save_setting(key: str, value: str):
             "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
             [key, value],
         )
-        conn.commit()
+
+
+def get_receipt_stats() -> dict:
+    """Get metrics about indexed receipts, including low-confidence items."""
+    with db_conn(read_only=True) as conn:
+        try:
+            # Check if table exists
+            table_check = conn.execute("SELECT * FROM information_schema.tables WHERE table_name = 'receipt_index'").fetchone()
+            if not table_check:
+                return {"total": 0, "avg_confidence": 0.0, "low_confidence_count": 0, "low_confidence_list": []}
+
+            r = conn.execute("""
+                SELECT
+                    COUNT(*),
+                    AVG(extraction_confidence),
+                    SUM(CASE WHEN extraction_confidence < 0.5 THEN 1 ELSE 0 END)
+                FROM receipt_index
+            """).fetchone()
+            
+            # Fetch low confidence files
+            low_conf = conn.execute("""
+                SELECT file_path, vendor_extracted, amount_extracted, extraction_confidence
+                FROM receipt_index
+                WHERE extraction_confidence < 0.5
+                ORDER BY extraction_confidence ASC
+            """).fetchall()
+            
+            return {
+                "total": int(r[0] or 0),
+                "avg_confidence": float(r[1] or 0.0),
+                "low_confidence_count": int(r[2] or 0),
+                "low_confidence_list": [
+                    {"path": row[0], "vendor": row[1] or "Unknown", "amount": row[2] or 0.0, "confidence": row[3] or 0.0}
+                    for row in low_conf
+                ]
+            }
+        except Exception:
+            return {"total": 0, "avg_confidence": 0.0, "low_confidence_count": 0, "low_confidence_list": []}

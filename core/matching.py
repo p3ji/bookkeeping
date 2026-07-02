@@ -247,3 +247,38 @@ def match_all_transactions(province: str = "ON") -> dict:
             unmatched_count += 1
 
     return {"matched": matched_count, "unmatched": unmatched_count}
+
+
+def find_best_matches(rx_date: str | None, rx_amount: float | None, rx_vendor: str, limit: int = 3) -> list[dict]:
+    """
+    Score all unmatched transactions against a single receipt's details.
+    Returns a list of candidate transactions sorted by match score.
+    """
+    tx_df = get_all_transactions()
+    if tx_df.empty:
+        return []
+    
+    # Filter to transactions that don't have a receipt_path
+    unmatched = tx_df[tx_df["receipt_path"].isna() | (tx_df["receipt_path"] == "") | (tx_df["receipt_path"] == "None")]
+    
+    candidates = []
+    for _, tx in unmatched.iterrows():
+        # Score the transaction
+        score = _score(
+            tx["date"], float(tx["amount_gross"]), str(tx["vendor"]),
+            rx_date, rx_amount, rx_vendor
+        )
+        candidates.append({
+            "transaction_id": tx["transaction_id"],
+            "date": str(tx["date"]),
+            "vendor": str(tx["vendor"]),
+            "amount_gross": float(tx["amount_gross"]),
+            "score": score,
+            "tx_dict": tx.to_dict()
+        })
+        
+    # Sort by score descending
+    candidates = sorted(candidates, key=lambda c: c["score"], reverse=True)
+    
+    # Return matches above a baseline threshold (e.g. 30)
+    return [c for c in candidates if c["score"] >= 30][:limit]

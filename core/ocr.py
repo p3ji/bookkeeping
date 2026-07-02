@@ -23,7 +23,7 @@ except ImportError:
 
 try:
     import pytesseract
-    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageDraw
     if os.path.exists(TESSERACT_PATH):
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
     _TESSERACT = True
@@ -336,3 +336,123 @@ def ocr_capabilities() -> dict:
         "opencv": _CV2,
         "ocr_lang": _OCR_LANG,
     }
+
+
+def draw_highlights_on_image(
+    file_path: str | Path,
+    vendor: str = "",
+    date: str = "",
+    total: float | None = None,
+    tax: float | None = None,
+) -> bytes | None:
+    """
+    Open the receipt file, perform word OCR to get coordinates, search for matching 
+    vendor, date, total, and tax strings, and draw colored highlight boxes over them.
+    Returns PNG bytes of the highlighted image.
+    """
+    if not _TESSERACT:
+        return None
+        
+    try:
+        import pandas as pd
+        path = Path(file_path)
+        img = None
+        if path.suffix.lower() == ".pdf":
+            if not _FITZ:
+                return None
+            doc = fitz.open(str(path))
+            page = doc[0]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+        else:
+            img = Image.open(str(path))
+            img = ImageOps.exif_transpose(img)
+            
+        w, h = img.size
+        # Downscale for preview (max width 800) to keep memory usage low and matches fast
+        max_width = 800
+        if w > max_width:
+            img = img.resize((max_width, int(h * max_width / w)), Image.LANCZOS)
+            
+        # Get words and their positions on the preprocessed/scaled image
+        words = extract_words_with_positions(img)
+        if not words:
+            # Try preprocessing if raw image gave nothing
+            p_img = _preprocess(img)
+            words = extract_words_with_positions(p_img)
+            
+        if not words:
+            # Return original preview if no OCR matches
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+            
+        # Create transparent overlay layer
+        overlay = Image.new("RGBA", img.size, (200, 200, 200, 0))
+        draw = ImageDraw.Draw(overlay)
+        
+        # Helper to draw box
+        def draw_box(box, color):
+            # box: {left, top, width, height}
+            l, t, w_b, h_b = box["left"], box["top"], box["width"], box["height"]
+            # draw a semi-transparent rectangle
+            draw.rectangle([l, t, l + w_b, t + h_b], fill=color)
+
+        # Prepare queries
+        # Vendor words
+        vendor_words = [vw.strip().lower() for vw in vendor.split() if len(vw.strip()) > 2] if vendor else []
+        # Date components (e.g. "2026-07-02" -> ["2026", "07", "02"] or month name)
+        date_words = []
+        if date:
+            date_words.extend([d.strip() for d in date.split("-") if d.strip()])
+            try:
+                dt_obj = pd.to_datetime(date)
+                date_words.append(dt_obj.strftime("%b")) # e.g. "Jul"
+                date_words.append(dt_obj.strftime("%B")) # e.g. "July"
+            except Exception:
+                pass
+        date_words = [dw.lower() for dw in date_words if len(dw) > 1]
+        
+        # Total strings
+        total_strs = []
+        if total is not None and total > 0:
+            total_strs.append(f"{total:.2f}")
+            total_strs.append(f"{total:.0f}")
+            total_strs.append(str(total))
+            
+        # Tax strings
+        tax_strs = []
+        if tax is not None and tax > 0:
+            tax_strs.append(f"{tax:.2f}")
+            tax_strs.append(str(tax))
+
+        for word in words:
+            text = word["text"].strip().lower()
+            if not text:
+                continue
+                
+            # Match Vendor -> Blue
+            if any(vw in text for vw in vendor_words):
+                draw_box(word, (0, 100, 255, 90))
+                
+            # Match Date -> Green
+            elif any(dw in text for dw in date_words):
+                draw_box(word, (0, 200, 0, 90))
+                
+            # Match Total -> Yellow
+            elif any(ts in text for ts in total_strs):
+                draw_box(word, (255, 200, 0, 95))
+                
+            # Match Tax -> Red
+            elif any(txs in text for txs in tax_strs):
+                draw_box(word, (255, 0, 0, 90))
+
+        # Composite overlay onto original image
+        img = img.convert("RGBA")
+        highlighted = Image.alpha_composite(img, overlay)
+        
+        buf = io.BytesIO()
+        highlighted.convert("RGB").save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None

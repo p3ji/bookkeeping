@@ -4,11 +4,11 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
-IMPORTS_DIR = BASE_DIR / "imports"
+STATEMENTS_DIR = BASE_DIR / "statements"
 RECEIPTS_DIR = BASE_DIR / "receipts"
 EXPORTS_DIR = BASE_DIR / "exports"
 
-for _d in [DATA_DIR, IMPORTS_DIR, RECEIPTS_DIR, EXPORTS_DIR]:
+for _d in [DATA_DIR, STATEMENTS_DIR, RECEIPTS_DIR, EXPORTS_DIR]:
     _d.mkdir(exist_ok=True)
 
 DB_PATH = DATA_DIR / "bookkeeping.duckdb"
