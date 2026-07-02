@@ -294,7 +294,10 @@ def _line_to_tx(line: str, default_year: int) -> dict | None:
     if any(kw in lower for kw in _SKIP_KEYWORDS):
         return None
 
-    # Strip trailing OCR punctuation that often appears after amounts (e.g. "59.3.")
+    # Normalise trailing OCR punctuation before amount search:
+    #   "40.."  → "40.00"  (cents OCR'd as dots, common on thermal printers)
+    #   "59.3." → "59.3"   (lone trailing dot after last digit)
+    line = re.sub(r"(\d)\.\.\s*$", r"\1.00", line)
     line = re.sub(r"([0-9])[.\s]+$", r"\1", line).strip()
 
     # Amount must be at end — allow 1 or 2 decimal digits (OCR sometimes drops trailing zero)
@@ -325,6 +328,8 @@ def _line_to_tx(line: str, default_year: int) -> dict | None:
         re.compile(r"^[A-Za-z]{3}\.?\s+\d{1,2}[,\s]+\d{4}"),
         re.compile(r"^[A-Za-z]{3}\.?\s+\d{1,2}"),
         re.compile(r"^[A-Za-z]{3}\d{1,2}"),    # compact: "Jun19" (no space — OCR artifact)
+        # CIBC dual-date: "May May 27" — Trans Date garbled + Post Date in same OCR line
+        re.compile(r"^[A-Za-z]{3}\.?\s+[A-Za-z]{3}\.?\s+\d{1,2}"),
     ]
     date_str = None
     vendor_str = prefix
@@ -333,6 +338,10 @@ def _line_to_tx(line: str, default_year: int) -> dict | None:
         m = pat.match(prefix)
         if m:
             raw_date = m.group(0)
+            # CIBC OCR: "May May 27" (Trans Date garbled + Post Date) → take second occurrence
+            dd_m = re.match(r"^[A-Za-z]{3}\.?\s+([A-Za-z]{3}\.?\s+\d{1,2})$", raw_date.strip())
+            if dd_m:
+                raw_date = dd_m.group(1)
             if re.match(r"^\d{1,2}/\d{1,2}$", raw_date):
                 raw_date = f"{raw_date}/{default_year}"
             elif re.match(r"^[A-Za-z]{3}\.?\s+\d{1,2}$", raw_date):
@@ -451,6 +460,7 @@ def _ocr_image_to_lines(img_path: Path, lang: str = "eng") -> list[str]:
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
     img = ImageEnhance.Contrast(img).enhance(1.8)
+
     img = img.filter(ImageFilter.SHARPEN)
 
     # Deskew with a conservative angle limit so tilted statement photos OCR better.
@@ -560,6 +570,11 @@ def _merge_fragmented_lines(lines: list[str], default_year: int) -> list[dict]:
     MONTH_RE = re.compile(
         r"^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2}", re.I
     )
+    # Doubled-date pattern: "May May 27" (Trans Date garbled + Post Date — common in CIBC OCR)
+    DOUBLE_DATE_RE = re.compile(
+        r"^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+"
+        r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2}", re.I
+    )
     AMT_RE = re.compile(r"[\d,]+\.\d{1,2}\s*(?:CR)?\s*$")
 
     results: list[dict] = []
@@ -584,12 +599,16 @@ def _merge_fragmented_lines(lines: list[str], default_year: int) -> list[dict]:
             continue
 
         # If line has a date but no amount, try merging with subsequent lines
-        if MONTH_RE.match(line) and not AMT_RE.search(line):
+        if (MONTH_RE.match(line) or DOUBLE_DATE_RE.match(line)) and not AMT_RE.search(line):
             for lookahead in range(1, 5):
                 j = i + lookahead
                 if j >= len(lines) or j in used:
                     continue
-                candidate = (line + " " + lines[j].strip()).strip()
+                next_line = lines[j].strip()
+                # Stop merging when we hit another dated line — it's a new transaction
+                if MONTH_RE.match(next_line) or DOUBLE_DATE_RE.match(next_line):
+                    break
+                candidate = (line + " " + next_line).strip()
                 tx = _line_to_tx(candidate, default_year)
                 if tx:
                     results.append(tx)
@@ -761,6 +780,91 @@ def import_statement(
         "skipped": 0,
         "filename": filename,
         "preview": df.head(10).to_dict("records"),
+    }
+
+
+def import_statement_multi(
+    source: str | Path | bytes | io.BytesIO,
+    filename: str = "statement",
+    province: str = DEFAULT_PROVINCE,
+    default_year: int | None = None,
+    methods: list[str] | None = None,
+) -> dict:
+    """
+    Parse a statement PDF/image through one or more extraction methods
+    (see core.extraction) and persist transactions.
+
+    With a single method this behaves like import_statement(). With several,
+    rows are reconciled: agreement is saved normally, disagreement is saved with
+    an audit flag + note so it surfaces on the Triage "pending" queue. Same
+    return shape as import_statement(), plus 'flagged_count'.
+    """
+    from datetime import date as _date
+    from core.extraction import extract_statement
+
+    if default_year is None:
+        default_year = _date.today().year
+    if not methods:
+        methods = ["deterministic"]
+
+    result = extract_statement(source, filename, methods, default_year)
+    if not result.rows:
+        raise ValueError("No transactions found by any selected extraction method.")
+
+    df = pd.DataFrame(result.rows).drop_duplicates(subset=["date", "vendor", "amount_gross"])
+
+    new_count = 0
+    flagged_count = 0
+    for _, row in df.iterrows():
+        tx_id = make_tx_id(row["date"], row["vendor"], row["amount_gross"])
+        cra_line, cra_desc = auto_categorize(row["vendor"])
+        gst_hst    = estimate_tax(row["amount_gross"], province)
+        amount_net = calculate_net(row["amount_gross"], gst_hst)
+        flags      = check_audit_flags(
+            vendor=row["vendor"], amount_gross=row["amount_gross"],
+            cra_line=cra_line, business_percentage=1.0, raw_text="",
+        )
+
+        review_note = row.get("_review_note")
+        # DataFrame back-fills missing dict keys with NaN (truthy!) when only some
+        # rows carry "_review_note" — must check for real string content, not just truthiness.
+        review_note = review_note if isinstance(review_note, str) and review_note else None
+        notes = ""
+        if review_note:
+            flags.append("EXTRACTION MISMATCH: methods disagree, please verify.")
+            notes = f"Extraction review: {review_note}"
+            flagged_count += 1
+
+        upsert_transaction({
+            "transaction_id": tx_id,
+            "date": row["date"],
+            "vendor": row["vendor"],
+            "amount_gross": row["amount_gross"],
+            "amount_net": amount_net,
+            "gst_hst_amount": gst_hst,
+            "is_business": True,
+            "business_percentage": 1.0,
+            "cra_line": cra_line,
+            "cra_description": cra_desc,
+            "receipt_path": None,
+            "raw_receipt_text": None,
+            "audit_flags": flags,
+            "verified_status": False,
+            "notes": notes,
+            "import_source": filename,
+            "extraction_method": result.method_used,
+            "extraction_confidence": result.confidence,
+        })
+        new_count += 1
+
+    return {
+        "total_rows": len(df),
+        "new_records": new_count,
+        "flagged_count": flagged_count,
+        "skipped": 0,
+        "filename": filename,
+        "method_used": result.method_used,
+        "preview": df.drop(columns=["_review_note"], errors="ignore").head(10).to_dict("records"),
     }
 
 

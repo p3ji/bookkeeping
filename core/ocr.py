@@ -124,8 +124,16 @@ def _preprocess(img: "Image.Image", for_statement: bool = False) -> "Image.Image
         scale = _MIN_WIDTH_PX / w
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-    # Step 4: Contrast
-    img = ImageEnhance.Contrast(img).enhance(1.8)
+    # Step 4: CLAHE — better than flat contrast for uneven-lit phone photos
+    if _CV2:
+        try:
+            arr = np.array(img)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            img = Image.fromarray(clahe.apply(arr))
+        except Exception:
+            img = ImageEnhance.Contrast(img).enhance(1.8)
+    else:
+        img = ImageEnhance.Contrast(img).enhance(1.8)
 
     # Step 5: Sharpen
     img = img.filter(ImageFilter.SHARPEN)

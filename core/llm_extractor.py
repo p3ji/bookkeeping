@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -195,6 +196,104 @@ def extract_receipt_data_llm(image_path: str | Path) -> dict:
             options={"temperature": 0},
         )
         raw = response.message.content.strip()
+        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not json_match:
+            return {}
+        return json.loads(json_match.group(0))
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Cloud LLM (Anthropic) — opt-in, gated by Settings > cloud_llm_enabled
+# ---------------------------------------------------------------------------
+
+_ANTHROPIC_MODEL = "claude-sonnet-5"
+
+
+def is_cloud_llm_available() -> bool:
+    """Return True if the anthropic package is installed and an API key is set.
+
+    Capability check only — does NOT check the cloud_llm_enabled app setting.
+    Callers that need the user's explicit opt-in should also check that
+    (see core.extraction.available_methods).
+    """
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return False
+    try:
+        import anthropic  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _cloud_vision_call(prompt: str, img_b64: str, max_tokens: int = 2048) -> str:
+    """Send an image + prompt to the cloud vision LLM and return its text response."""
+    import anthropic
+    client = anthropic.Anthropic()
+    response = client.messages.create(
+        model=_ANTHROPIC_MODEL,
+        max_tokens=max_tokens,
+        temperature=0,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": img_b64,
+                }},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+    )
+    return "".join(block.text for block in response.content if block.type == "text").strip()
+
+
+def extract_statement_transactions_cloud(
+    image_path: str | Path,
+    default_year: int,
+) -> list[dict]:
+    """Cloud-LLM equivalent of extract_statement_transactions(). [] on failure."""
+    path = Path(image_path)
+    if not path.exists() or not is_cloud_llm_available():
+        return []
+
+    try:
+        img_b64 = _encode_image(path)
+        raw = _cloud_vision_call(_STATEMENT_PROMPT, img_b64)
+        json_match = re.search(r"\[.*\]", raw, re.DOTALL)
+        if not json_match:
+            return []
+        rows = json.loads(json_match.group(0))
+        results = []
+        for row in rows:
+            try:
+                import pandas as pd
+                date_str = pd.to_datetime(str(row.get("date", "")),
+                                          dayfirst=False).strftime("%Y-%m-%d")
+                amount = float(row.get("amount", 0))
+                vendor = str(row.get("vendor", "")).strip()
+                if date_str and amount > 0 and vendor:
+                    results.append({
+                        "date": date_str,
+                        "vendor": vendor,
+                        "amount_gross": round(amount, 2),
+                    })
+            except Exception:
+                continue
+        return results
+    except Exception:
+        return []
+
+
+def extract_receipt_data_llm_cloud(image_path: str | Path) -> dict:
+    """Cloud-LLM equivalent of extract_receipt_data_llm(). {} on failure."""
+    path = Path(image_path)
+    if not path.exists() or not is_cloud_llm_available():
+        return {}
+
+    try:
+        img_b64 = _encode_image(path)
+        raw = _cloud_vision_call(_RECEIPT_PROMPT, img_b64)
         json_match = re.search(r"\{.*\}", raw, re.DOTALL)
         if not json_match:
             return {}

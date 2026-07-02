@@ -63,14 +63,26 @@ def _vendor_similarity(a: str, b: str) -> int:
 # Receipt indexing
 # ---------------------------------------------------------------------------
 
-def index_receipts(receipts_dir: Path = RECEIPTS_DIR, progress_cb=None) -> int:
+def index_receipts(
+    receipts_dir: Path = RECEIPTS_DIR,
+    progress_cb=None,
+    methods: list[str] | None = None,
+) -> dict:
     """
-    Scan receipts directory, OCR unindexed files, and save to receipt_index.
-    Returns the number of files newly indexed.
+    Scan receipts directory, extract data for unindexed files via the selected
+    extraction method(s) (see core.extraction), and save to receipt_index.
+    Returns {"new_count": int, "flagged_count": int} — flagged_count is receipts
+    where selected methods disagreed or overall extraction confidence was low.
     """
+    from core.extraction import extract_receipt
+
+    if not methods:
+        methods = ["deterministic"]
+
     all_files = find_receipt_files(receipts_dir)
     indexed_paths = get_indexed_paths()
     new_count = 0
+    flagged_count = 0
 
     for i, fp in enumerate(all_files):
         file_path_str = str(fp)
@@ -80,17 +92,32 @@ def index_receipts(receipts_dir: Path = RECEIPTS_DIR, progress_cb=None) -> int:
         if progress_cb:
             progress_cb(i + 1, len(all_files), fp.name)
 
-        text = extract_text(fp)
-        amount = extract_amount_from_text(text)
-        tax = extract_tax_from_text(text)
-        date_found = _parse_date_from_text(text)
+        result = extract_receipt(fp, methods)
+        rd = result.receipt
 
-        # Rough vendor: use directory name or first text line
-        vendor_guess = fp.parent.name  # month directory is a weak signal
-        if text:
+        # Fall back to raw OCR text if the structured parse came back empty.
+        text = (rd.raw_text if rd and rd.raw_text else "") or extract_text(fp)
+
+        date_found = None
+        if rd and rd.date:
+            try:
+                date_found = pd.to_datetime(rd.date).date()
+            except Exception:
+                date_found = None
+        if date_found is None:
+            date_found = _parse_date_from_text(text)
+
+        amount = rd.total if (rd and rd.total is not None) else extract_amount_from_text(text)
+
+        # Rough vendor: prefer the structured extraction, else directory/first-line heuristics
+        vendor_guess = (rd.vendor if rd and rd.vendor else "") or fp.parent.name
+        if not (rd and rd.vendor) and text:
             first_line = text.strip().split("\n")[0][:50]
             if len(first_line) > 3:
                 vendor_guess = first_line
+
+        if result.flags or result.confidence < 0.5:
+            flagged_count += 1
 
         mtime = datetime.fromtimestamp(os.path.getmtime(fp))
 
@@ -101,11 +128,13 @@ def index_receipts(receipts_dir: Path = RECEIPTS_DIR, progress_cb=None) -> int:
             "date_extracted": str(date_found) if date_found else None,
             "amount_extracted": amount,
             "vendor_extracted": vendor_guess,
-            "raw_text": text[:10_000],  # cap stored text
+            "raw_text": (text or "")[:10_000],  # cap stored text
+            "extraction_method": result.method_used,
+            "extraction_confidence": result.confidence,
         })
         new_count += 1
 
-    return new_count
+    return {"new_count": new_count, "flagged_count": flagged_count}
 
 
 # ---------------------------------------------------------------------------

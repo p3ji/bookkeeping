@@ -7,10 +7,11 @@ import streamlit as st
 st.set_page_config(page_title="Import", page_icon="📥", layout="wide")
 
 from core.database import init_db, get_setting
-from core.ingestion import import_csv, import_statement
+from core.ingestion import import_csv, import_statement, import_statement_multi
 from core.matching import index_receipts, match_all_transactions
 from core.ocr import ocr_capabilities
-from core.llm_extractor import is_ollama_available, ollama_vision_model, INSTALL_INSTRUCTIONS
+from core.llm_extractor import INSTALL_INSTRUCTIONS
+from core.extraction import available_methods, METHOD_LABELS
 from core.playwright_extractor import is_playwright_available, extract_from_url, extract_from_html_file
 from config import IMPORTS_DIR, RECEIPTS_DIR
 
@@ -68,32 +69,33 @@ with tab_folder:
                     st.error(f"Import failed: {e}", icon="🚨")
 
 with tab_statement:
-    _ollama_ok = is_ollama_available()
-    _ollama_model = ollama_vision_model() if _ollama_ok else None
+    _stmt_methods_avail = available_methods()
 
-    # Mode selector: LLM (if available) or Tesseract OCR
-    if _ollama_ok:
-        extract_mode = st.radio(
-            "Extraction engine",
-            ["🤖 Vision LLM (Ollama — recommended for photos)", "🔤 Tesseract OCR"],
-            horizontal=True,
-            key="stmt_mode",
-        )
-        use_llm = "LLM" in extract_mode
-        st.caption(f"Using model: `{_ollama_model}`")
-    else:
-        use_llm = False
+    if len(_stmt_methods_avail) == 1:
         with st.expander("💡 Better extraction available — click to learn more"):
             st.markdown(INSTALL_INSTRUCTIONS)
 
-    st.markdown(
-        "Upload a credit card statement as a **PDF, JPEG, or PNG**. "
-        "For **digital PDFs** (downloaded from your bank portal) Tesseract works great. "
-        "For **phone photos** of paper statements, the Vision LLM gives much better results."
+    stmt_methods = st.multiselect(
+        "Extraction method(s) — select more than one to cross-check results",
+        options=_stmt_methods_avail,
+        default=["deterministic"],
+        format_func=lambda m: METHOD_LABELS.get(m, m),
+        key="stmt_methods",
     )
 
-    if not ocr["pdfplumber"] and not ocr["tesseract"] and not _ollama_ok:
+    st.markdown(
+        "Upload a credit card statement as a **PDF, JPEG, or PNG**. "
+        "For **digital PDFs** (downloaded from your bank portal), Deterministic (OCR/regex) "
+        "works great. For **phone photos** of paper statements, an LLM method gives much "
+        "better results. Selecting more than one method cross-checks them: agreeing "
+        "transactions import normally, disagreements are flagged for review on Triage."
+    )
+
+    if (not ocr["pdfplumber"] and not ocr["tesseract"]
+            and "ollama" not in _stmt_methods_avail and "cloud" not in _stmt_methods_avail):
         st.error("No extraction libraries available. Install pdfplumber, Tesseract, or Ollama.", icon="🚨")
+    elif not stmt_methods:
+        st.info("Select at least one extraction method above.")
     else:
         stmt_file = st.file_uploader(
             "Upload statement",
@@ -108,33 +110,7 @@ with tab_statement:
             step=1,
         )
         if stmt_file and st.button("Parse & Import Statement", key="btn_stmt", type="primary"):
-            if use_llm and _ollama_ok:
-                # Save temp file, run vision LLM, import results
-                import tempfile, os as _os
-                from core.ingestion import import_statement_rows
-                suffix = Path(stmt_file.name).suffix or ".jpg"
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                    tmp.write(stmt_file.read())
-                    tmp_path = Path(tmp.name)
-                try:
-                    with st.spinner(f"Analysing image with `{_ollama_model}` — may take 10-30 s…"):
-                        from core.llm_extractor import extract_statement_transactions
-                        rows = extract_statement_transactions(tmp_path, int(stmt_year))
-                finally:
-                    _os.unlink(tmp_path)
-
-                if not rows:
-                    st.error("LLM returned no transactions. Try Tesseract OCR mode instead.", icon="🚨")
-                else:
-                    result = import_statement_rows(rows, filename=stmt_file.name, province=province)
-                    st.success(
-                        f"Imported **{result['new_records']}** transactions "
-                        f"from `{stmt_file.name}` via Vision LLM.",
-                        icon="✅",
-                    )
-                    if result.get("preview"):
-                        st.dataframe(result["preview"], hide_index=True)
-            else:
+            if stmt_methods == ["deterministic"]:
                 with st.spinner("Extracting transactions via OCR — this may take a moment…"):
                     try:
                         result = import_statement(
@@ -161,9 +137,38 @@ with tab_statement:
                         else:
                             st.error(f"Statement parsing failed: {msg}", icon="🚨")
                         st.caption(
-                            "Tip: For best results with phone photos, install Ollama + llama3.2-vision. "
-                            "For digital statements, export as CSV or PDF from your bank portal."
+                            "Tip: For best results with phone photos, select an LLM extraction "
+                            "method above. For digital statements, export as CSV or PDF from "
+                            "your bank portal."
                         )
+            else:
+                label = " + ".join(METHOD_LABELS.get(m, m) for m in stmt_methods)
+                with st.spinner(f"Extracting via {label} — may take up to 30 s…"):
+                    try:
+                        result = import_statement_multi(
+                            stmt_file.read(),
+                            filename=stmt_file.name,
+                            province=province,
+                            default_year=int(stmt_year),
+                            methods=stmt_methods,
+                        )
+                        st.success(
+                            f"Imported **{result['new_records']}** transactions "
+                            f"from `{stmt_file.name}` via {label}.",
+                            icon="✅",
+                        )
+                        if result.get("flagged_count"):
+                            st.warning(
+                                f"{result['flagged_count']} of {result['new_records']} "
+                                f"transactions need review — extraction methods disagreed. "
+                                f"See Triage.",
+                                icon="⚠️",
+                            )
+                        if result.get("preview"):
+                            st.markdown("**Preview (first 10):**")
+                            st.dataframe(result["preview"], hide_index=True)
+                    except Exception as e:
+                        st.error(f"Statement parsing failed: {e}", icon="🚨")
 
 with tab_web:
     st.markdown(
@@ -313,10 +318,18 @@ st.markdown(
 receipt_files_total = len(list(RECEIPTS_DIR.rglob("*")))
 st.caption(f"Receipts folder: `{RECEIPTS_DIR}` — {receipt_files_total} files found")
 
+receipt_methods = st.multiselect(
+    "Extraction method(s) for receipt scanning — select more than one to cross-check",
+    options=available_methods(),
+    default=["deterministic"],
+    format_func=lambda m: METHOD_LABELS.get(m, m),
+    key="receipt_methods",
+)
+
 col_scan, col_match = st.columns(2)
 
 with col_scan:
-    if st.button("🔍 Scan Receipts (OCR)", type="primary"):
+    if st.button("🔍 Scan Receipts (OCR)", type="primary", disabled=not receipt_methods):
         progress_bar = st.progress(0, text="Starting…")
         status_text = st.empty()
         count_box = [0]
@@ -327,10 +340,17 @@ with col_scan:
             progress_bar.progress(pct / 100, text=f"{current}/{total}: {name}")
             status_text.text(f"Processing: {name}")
 
-        new_indexed = index_receipts(RECEIPTS_DIR, progress_cb=on_progress)
+        scan_result = index_receipts(RECEIPTS_DIR, progress_cb=on_progress, methods=receipt_methods)
         progress_bar.empty()
         status_text.empty()
-        st.success(f"Indexed **{new_indexed}** new receipt files.", icon="✅")
+        st.success(f"Indexed **{scan_result['new_count']}** new receipt files.", icon="✅")
+        if scan_result.get("flagged_count"):
+            st.warning(
+                f"{scan_result['flagged_count']} receipt(s) had low-confidence or "
+                f"disagreeing extraction — worth a manual look before relying on "
+                f"auto-matching.",
+                icon="⚠️",
+            )
 
 with col_match:
     if st.button("🔗 Match Receipts to Transactions"):

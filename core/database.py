@@ -73,10 +73,21 @@ def init_db():
             )
         """)
 
+        # Extraction provenance — safe no-op migration on existing DB files.
+        conn.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS "
+                      "extraction_method VARCHAR DEFAULT 'deterministic'")
+        conn.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS "
+                      "extraction_confidence DECIMAL(5,4)")
+        conn.execute("ALTER TABLE receipt_index ADD COLUMN IF NOT EXISTS "
+                      "extraction_method VARCHAR DEFAULT 'deterministic'")
+        conn.execute("ALTER TABLE receipt_index ADD COLUMN IF NOT EXISTS "
+                      "extraction_confidence DECIMAL(5,4)")
+
         _defaults = [
             ("province", "ON"),
             ("business_name", "My Business"),
             ("fiscal_year_start", "01"),
+            ("cloud_llm_enabled", "false"),
         ]
         for k, v in _defaults:
             try:
@@ -147,8 +158,9 @@ def upsert_transaction(tx: dict):
                 transaction_id, date, vendor, amount_gross, amount_net,
                 gst_hst_amount, is_business, business_percentage, cra_line,
                 cra_description, receipt_path, raw_receipt_text, audit_flags,
-                verified_status, notes, import_source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                verified_status, notes, import_source,
+                extraction_method, extraction_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (transaction_id) DO NOTHING
             """,
             [
@@ -159,6 +171,7 @@ def upsert_transaction(tx: dict):
                 tx.get("raw_receipt_text"), flags_json,
                 tx.get("verified_status", False), tx.get("notes", ""),
                 tx.get("import_source"),
+                tx.get("extraction_method", "deterministic"), tx.get("extraction_confidence"),
             ],
         )
         conn.commit()
@@ -213,20 +226,24 @@ def upsert_receipt_index(receipt: dict):
             """
             INSERT INTO receipt_index (
                 receipt_id, file_path, file_modified, date_extracted,
-                amount_extracted, vendor_extracted, raw_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                amount_extracted, vendor_extracted, raw_text,
+                extraction_method, extraction_confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (file_path) DO UPDATE SET
-                date_extracted   = excluded.date_extracted,
-                amount_extracted = excluded.amount_extracted,
-                vendor_extracted = excluded.vendor_extracted,
-                raw_text         = excluded.raw_text,
-                indexed_at       = now()
+                date_extracted        = excluded.date_extracted,
+                amount_extracted      = excluded.amount_extracted,
+                vendor_extracted      = excluded.vendor_extracted,
+                raw_text              = excluded.raw_text,
+                extraction_method     = excluded.extraction_method,
+                extraction_confidence = excluded.extraction_confidence,
+                indexed_at            = now()
             """,
             [
                 receipt["receipt_id"], receipt["file_path"],
                 receipt.get("file_modified"), receipt.get("date_extracted"),
                 receipt.get("amount_extracted"), receipt.get("vendor_extracted"),
                 receipt.get("raw_text"),
+                receipt.get("extraction_method", "deterministic"), receipt.get("extraction_confidence"),
             ],
         )
         conn.commit()

@@ -108,6 +108,52 @@ if caps["tesseract"]:
 st.divider()
 
 # ---------------------------------------------------------------------------
+# Cloud LLM (optional, opt-in)
+# ---------------------------------------------------------------------------
+st.header("Cloud LLM (optional)")
+st.caption(
+    "A local Ollama vision model is used for LLM-assisted extraction by default — "
+    "nothing leaves this machine. Cloud LLM is a second, opt-in fallback for documents "
+    "the local model still can't read."
+)
+
+from core.llm_extractor import is_cloud_llm_available
+import os as _os
+
+_has_key = bool(_os.environ.get("ANTHROPIC_API_KEY"))
+try:
+    import anthropic  # noqa: F401
+    _has_pkg = True
+except ImportError:
+    _has_pkg = False
+
+cc1, cc2, cc3 = st.columns([1, 2, 3])
+cc1.markdown(f"{'✅' if _has_pkg else '❌'} **anthropic package**")
+cc2.caption("Cloud vision extraction library")
+if not _has_pkg:
+    cc3.caption("To enable: `pip install anthropic`")
+
+cc1, cc2, cc3 = st.columns([1, 2, 3])
+cc1.markdown(f"{'✅' if _has_key else '❌'} **ANTHROPIC_API_KEY**")
+cc2.caption("API key, read from the environment — never stored in this app's database")
+if not _has_key:
+    cc3.caption("Set the `ANTHROPIC_API_KEY` environment variable, then restart the app")
+
+cloud_enabled = st.checkbox(
+    "Enable Cloud LLM as a selectable extraction method",
+    value=get_setting("cloud_llm_enabled", "false") == "true",
+    disabled=not is_cloud_llm_available(),
+    help="Off by default. Turning this on lets you select Cloud LLM when importing "
+         "statements or scanning receipts. Enabling it means document images you choose "
+         "to process this way are sent to Anthropic's API for that extraction.",
+)
+if cloud_enabled != (get_setting("cloud_llm_enabled", "false") == "true"):
+    save_setting("cloud_llm_enabled", "true" if cloud_enabled else "false")
+    st.rerun()
+
+st.divider()
+
+# ---------------------------------------------------------------------------
 # Folder paths
 # ---------------------------------------------------------------------------
 st.header("Data Folders")
