@@ -15,6 +15,9 @@ import os
 import re
 from pathlib import Path
 from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -112,18 +115,20 @@ Rules:
 def extract_statement_transactions(
     image_path: str | Path,
     default_year: int,
-) -> list[dict]:
+) -> list[dict] | None:
     """
     Use a local Ollama vision LLM to extract transactions from a statement image.
-    Returns list of {date, vendor, amount_gross} dicts on success, [] on failure.
+    Returns list of {date, vendor, amount_gross} dicts on success, None on failure.
     """
     path = Path(image_path)
     if not path.exists():
-        return []
+        logger.error(f"Ollama Statement extraction failed: file does not exist {image_path}")
+        return None
 
     model = ollama_vision_model()
     if not model:
-        return []
+        logger.warning("Ollama Statement extraction skipped: no vision model found or server offline")
+        return None
 
     try:
         import ollama
@@ -141,7 +146,8 @@ def extract_statement_transactions(
         # Extract JSON array from response (model sometimes adds prose)
         json_match = re.search(r"\[.*\]", raw, re.DOTALL)
         if not json_match:
-            return []
+            logger.error(f"Ollama Statement extraction failed: no JSON array found in response: {raw}")
+            return None
         rows = json.loads(json_match.group(0))
         results = []
         for row in rows:
@@ -157,11 +163,13 @@ def extract_statement_transactions(
                         "vendor": vendor,
                         "amount_gross": round(amount, 2),
                     })
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Ollama Statement row extraction skipped row {row}: {e}")
                 continue
         return results
-    except Exception:
-        return []
+    except Exception as e:
+        logger.exception(f"Ollama Statement extraction failed for {image_path}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -189,18 +197,20 @@ Rules:
 - date format: YYYY-MM-DD"""
 
 
-def extract_receipt_data_llm(image_path: str | Path) -> dict:
+def extract_receipt_data_llm(image_path: str | Path) -> dict | None:
     """
     Use a local Ollama vision LLM to extract structured data from a receipt image.
-    Returns dict matching ReceiptData fields on success, {} on failure.
+    Returns dict matching ReceiptData fields on success, None on failure.
     """
     path = Path(image_path)
     if not path.exists():
-        return {}
+        logger.error(f"Ollama Receipt extraction failed: file does not exist {image_path}")
+        return None
 
     model = ollama_vision_model()
     if not model:
-        return {}
+        logger.warning("Ollama Receipt extraction skipped: no vision model found or server offline")
+        return None
 
     try:
         import ollama
@@ -217,10 +227,12 @@ def extract_receipt_data_llm(image_path: str | Path) -> dict:
         raw = response.message.content.strip()
         json_match = re.search(r"\{.*\}", raw, re.DOTALL)
         if not json_match:
-            return {}
+            logger.error(f"Ollama Receipt extraction failed: no JSON object found in response: {raw}")
+            return None
         return json.loads(json_match.group(0))
-    except Exception:
-        return {}
+    except Exception as e:
+        logger.exception(f"Ollama Receipt extraction failed for {image_path}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -270,18 +282,23 @@ def _cloud_vision_call(prompt: str, img_b64: str, max_tokens: int = 2048) -> str
 def extract_statement_transactions_cloud(
     image_path: str | Path,
     default_year: int,
-) -> list[dict]:
-    """Cloud-LLM equivalent of extract_statement_transactions(). [] on failure."""
+) -> list[dict] | None:
+    """Cloud-LLM equivalent of extract_statement_transactions(). None on failure."""
     path = Path(image_path)
-    if not path.exists() or not is_cloud_llm_available():
-        return []
+    if not path.exists():
+        logger.error(f"Claude Statement extraction failed: file does not exist {image_path}")
+        return None
+    if not is_cloud_llm_available():
+        logger.warning("Claude Statement extraction skipped: ANTHROPIC_API_KEY missing or package not installed")
+        return None
 
     try:
         img_b64 = _encode_image(path)
         raw = _cloud_vision_call(_STATEMENT_PROMPT, img_b64)
         json_match = re.search(r"\[.*\]", raw, re.DOTALL)
         if not json_match:
-            return []
+            logger.error(f"Claude Statement extraction failed: no JSON array found in response: {raw}")
+            return None
         rows = json.loads(json_match.group(0))
         results = []
         for row in rows:
@@ -297,28 +314,36 @@ def extract_statement_transactions_cloud(
                         "vendor": vendor,
                         "amount_gross": round(amount, 2),
                     })
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Claude Statement row extraction skipped row {row}: {e}")
                 continue
         return results
-    except Exception:
-        return []
+    except Exception as e:
+        logger.exception(f"Claude Statement extraction failed for {image_path}")
+        return None
 
 
-def extract_receipt_data_llm_cloud(image_path: str | Path) -> dict:
-    """Cloud-LLM equivalent of extract_receipt_data_llm(). {} on failure."""
+def extract_receipt_data_llm_cloud(image_path: str | Path) -> dict | None:
+    """Cloud-LLM equivalent of extract_receipt_data_llm(). None on failure."""
     path = Path(image_path)
-    if not path.exists() or not is_cloud_llm_available():
-        return {}
+    if not path.exists():
+        logger.error(f"Claude Receipt extraction failed: file does not exist {image_path}")
+        return None
+    if not is_cloud_llm_available():
+        logger.warning("Claude Receipt extraction skipped: ANTHROPIC_API_KEY missing or package not installed")
+        return None
 
     try:
         img_b64 = _encode_image(path)
         raw = _cloud_vision_call(_RECEIPT_PROMPT, img_b64)
         json_match = re.search(r"\{.*\}", raw, re.DOTALL)
         if not json_match:
-            return {}
+            logger.error(f"Claude Receipt extraction failed: no JSON object found in response: {raw}")
+            return None
         return json.loads(json_match.group(0))
-    except Exception:
-        return {}
+    except Exception as e:
+        logger.exception(f"Claude Receipt extraction failed for {image_path}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -366,17 +391,22 @@ def _gemini_vision_call(prompt: str, img_b64: str) -> str:
 def extract_statement_transactions_gemini(
     image_path: str | Path,
     default_year: int,
-) -> list[dict]:
-    """Gemini equivalent of extract_statement_transactions(). [] on failure."""
+) -> list[dict] | None:
+    """Gemini equivalent of extract_statement_transactions(). None on failure."""
     path = Path(image_path)
-    if not path.exists() or not is_gemini_available():
-        return []
+    if not path.exists():
+        logger.error(f"Gemini Statement extraction failed: file does not exist {image_path}")
+        return None
+    if not is_gemini_available():
+        logger.warning("Gemini Statement extraction skipped: GEMINI_API_KEY environment variable missing")
+        return None
 
     try:
         img_b64 = _encode_image(path)
         raw = _gemini_vision_call(_STATEMENT_PROMPT, img_b64)
         if not raw:
-            return []
+            logger.error("Gemini Statement extraction failed: empty response from API")
+            return None
         
         rows = json.loads(raw)
         results = []
@@ -392,27 +422,35 @@ def extract_statement_transactions_gemini(
                         "vendor": vendor,
                         "amount_gross": round(amount, 2),
                     })
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Gemini Statement row extraction skipped row {row}: {e}")
                 continue
         return results
-    except Exception:
-        return []
+    except Exception as e:
+        logger.exception(f"Gemini Statement extraction failed for {image_path}")
+        return None
 
 
-def extract_receipt_data_llm_gemini(image_path: str | Path) -> dict:
-    """Gemini equivalent of extract_receipt_data_llm(). {} on failure."""
+def extract_receipt_data_llm_gemini(image_path: str | Path) -> dict | None:
+    """Gemini equivalent of extract_receipt_data_llm(). None on failure."""
     path = Path(image_path)
-    if not path.exists() or not is_gemini_available():
-        return {}
+    if not path.exists():
+        logger.error(f"Gemini Receipt extraction failed: file does not exist {image_path}")
+        return None
+    if not is_gemini_available():
+        logger.warning("Gemini Receipt extraction skipped: GEMINI_API_KEY environment variable missing")
+        return None
 
     try:
         img_b64 = _encode_image(path)
         raw = _gemini_vision_call(_RECEIPT_PROMPT, img_b64)
         if not raw:
-            return {}
+            logger.error("Gemini Receipt extraction failed: empty response from API")
+            return None
         return json.loads(raw)
-    except Exception:
-        return {}
+    except Exception as e:
+        logger.exception(f"Gemini Receipt extraction failed for {image_path}")
+        return None
 
 
 # ---------------------------------------------------------------------------

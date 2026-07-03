@@ -74,6 +74,12 @@ province = get_setting("province", "ON")
 ocr = ocr_capabilities()
 pw_ok = is_playwright_available()
 
+# Initialize dynamic keys for file uploaders to allow clearing them on success (Bug 5)
+if "statements_uploader_key" not in st.session_state:
+    st.session_state.statements_uploader_key = 0
+if "receipts_uploader_key" not in st.session_state:
+    st.session_state.receipts_uploader_key = 0
+
 # ---------------------------------------------------------------------------
 # Section 1: Ingestion Zone
 # ---------------------------------------------------------------------------
@@ -87,14 +93,14 @@ with col_upload:
             "📄 Credit Card Statements",
             type=["csv", "pdf", "jpg", "jpeg", "png"],
             accept_multiple_files=True,
-            key="statements_uploader"
+            key=f"statements_uploader_{st.session_state.statements_uploader_key}"
         )
     with c_rcpt:
         uploaded_receipts = st.file_uploader(
             "📎 Receipts & Invoices",
             type=["pdf", "jpg", "jpeg", "png", "html", "htm"],
             accept_multiple_files=True,
-            key="receipts_uploader"
+            key=f"receipts_uploader_{st.session_state.receipts_uploader_key}"
         )
 
 with col_url:
@@ -248,7 +254,7 @@ if new_files_to_process or (fetch_btn and web_url):
                     status_str = f"✅ Extracted ({res.method_used})"
                     if res.confidence < 0.50:
                         status_str = "⚠️ Struggled (Low Confidence OCR)"
-                    elif not rd or not rd.vendor or rd.total is None:
+                    elif not rd or not rd.vendor or not rd.date or rd.total is None or rd.total == 0.0:
                         status_str = "⚠️ Struggled (Incomplete Fields)"
                     st.session_state.last_processed_batch.append({
                         "filename": filename,
@@ -482,7 +488,7 @@ else:
                                 preview_bytes = render_image_preview(path)
                     
                         if preview_bytes:
-                            st.image(preview_bytes, use_container_width=True)
+                            st.image(preview_bytes, width="stretch")
                         else:
                             st.caption("📄 No preview available")
                     
@@ -491,18 +497,40 @@ else:
                         st.markdown(f"📂 [Reveal file in Explorer]({abs_uri})")
                 
                     with col_match:
-                        # Display extracted details
-                        vendor_val = rd.vendor if rd else "Unknown"
-                        date_val = rd.date if rd else "Unknown"
-                        total_val = rd.total if (rd and rd.total is not None) else 0.0
-                        gst_hst_val = (rd.tax_hst or 0.0) + (rd.tax_gst or 0.0) if rd else 0.0
-                    
-                        st.markdown(f"**Extracted Info:**")
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("Vendor", vendor_val)
-                        c2.metric("Date", date_val)
-                        c3.metric("Total", f"${total_val:,.2f}")
-                        c4.metric("GST/HST", f"${gst_hst_val:,.2f}")
+                        # Display warning if OCR struggled (Bug 1 & 6)
+                        card_confidence = item.get("confidence", 1.0)
+                        total_missing = (rd.total is None or rd.total == 0.0) if rd else True
+                        date_missing = (not rd.date or rd.date == "Unknown") if rd else True
+                        vendor_missing = (not rd.vendor or rd.vendor == "Unknown") if rd else True
+                        
+                        if card_confidence < 0.50 or total_missing or date_missing or vendor_missing:
+                            st.error("⚠️ **OCR struggled with this receipt** (Low Confidence or missing fields). The extracted vendor, date, or total may be incorrect or missing. Please review and edit the details below.", icon="⚠️")
+                        
+                        # Checkbox to toggle editing/override of details
+                        edit_override = st.checkbox("✏️ Override Extracted Info", key=f"override_{import_id}", value=total_missing)
+                        
+                        if edit_override:
+                            st.markdown("**Edit Extracted Details:**")
+                            col_ed1, col_ed2 = st.columns(2)
+                            with col_ed1:
+                                vendor_val = st.text_input("Vendor", value=rd.vendor if rd and rd.vendor else "", key=f"ed_vendor_{import_id}")
+                                date_val = st.text_input("Date (YYYY-MM-DD)", value=rd.date if rd and rd.date else "", key=f"ed_date_{import_id}")
+                            with col_ed2:
+                                total_val = st.number_input("Total Amount ($)", min_value=0.0, value=float(rd.total) if rd and rd.total is not None else 0.0, step=0.01, format="%.2f", key=f"ed_total_{import_id}")
+                                gst_hst_val = st.number_input("GST/HST Tax ($)", min_value=0.0, value=float((rd.tax_hst or 0.0) + (rd.tax_gst or 0.0)) if rd else 0.0, step=0.01, format="%.2f", key=f"ed_tax_{import_id}")
+                        else:
+                            # Display extracted details as metrics
+                            vendor_val = rd.vendor if rd else "Unknown"
+                            date_val = rd.date if rd else "Unknown"
+                            total_val = rd.total if (rd and rd.total is not None) else 0.0
+                            gst_hst_val = (rd.tax_hst or 0.0) + (rd.tax_gst or 0.0) if rd else 0.0
+                        
+                            st.markdown(f"**Extracted Info:**")
+                            c1, c2, c3, c4 = st.columns(4)
+                            c1.metric("Vendor", vendor_val)
+                            c2.metric("Date", date_val)
+                            c3.metric("Total", f"${total_val:,.2f}")
+                            c4.metric("GST/HST", f"${gst_hst_val:,.2f}")
                     
                         # Line items breakdown
                         if rd and rd.line_items:
@@ -573,7 +601,8 @@ else:
                             st.rerun()
                         
                         # Create New Transaction
-                        if a2.button("➕ Create New Transaction", key=f"btn_create_{import_id}"):
+                        create_disabled = (total_val == 0.0)
+                        if a2.button("➕ Create New Transaction", key=f"btn_create_{import_id}", disabled=create_disabled, help="Disabled if total amount is $0.00. Override total to enable."):
                             tx_id = make_tx_id(date_val, vendor_val, total_val)
                             gst_hst = gst_hst_val if gst_hst_val > 0 else estimate_tax(total_val, province)
                             amount_net = calculate_net(total_val, gst_hst)
@@ -620,9 +649,12 @@ else:
                             for field_name in ["vendor", "date", "total", "tax"]:
                                 row_dict = {"Field": field_name.capitalize()}
                                 for m in ["deterministic", "ollama", "cloud", "gemini", "playwright"]:
-                                    m_data = by_method.get(m)
-                                    if not m_data:
+                                    if m not in by_method:
                                         row_dict[METHOD_LABELS.get(m, m)] = "—"
+                                        continue
+                                    m_data = by_method.get(m)
+                                    if m_data is None:
+                                        row_dict[METHOD_LABELS.get(m, m)] = "⚠️ Failed"
                                         continue
                                 
                                     # Resolve value
@@ -675,8 +707,79 @@ with st.expander("Show Batch Options"):
         "If you drop statement files directly into `statements/` or receipt files into `receipts/YYYY/MM/`, "
         "you can trigger batch operations here."
     )
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
+        import time
+        if st.button("📄 Scan Folder Statements", use_container_width=True):
+            progress_bar = st.progress(0, text="Scanning statements folder…")
+            status_text = st.empty()
+            
+            stmt_files = []
+            valid_exts = {".csv", ".pdf", ".jpg", ".jpeg", ".png"}
+            for p in STATEMENTS_DIR.glob("**/*"):
+                if p.is_file() and p.suffix.lower() in valid_exts:
+                    stmt_files.append(p)
+            
+            imported_count = 0
+            pending_count = 0
+            skipped_count = 0
+            
+            total_files = len(stmt_files)
+            for idx, p in enumerate(stmt_files):
+                filename = p.name
+                file_key = f"{filename}_{p.stat().st_size}"
+                
+                # Check if already processed or already in pending imports
+                already_pending = any(item.get("filename") == filename for item in st.session_state.pending_imports.values())
+                if file_key in st.session_state.processed_files or already_pending:
+                    skipped_count += 1
+                    continue
+                
+                pct = int((idx + 1) / total_files * 100)
+                progress_bar.progress(pct / 100, text=f"Processing {idx+1}/{total_files}: {filename}")
+                status_text.text(f"Processing: {filename}")
+                
+                try:
+                    if p.suffix.lower() == ".csv":
+                        # Direct import CSV
+                        import io
+                        with open(p, "rb") as f:
+                            res = import_csv(io.BytesIO(f.read()), filename=filename, province=province)
+                        st.session_state.processed_files.add(file_key)
+                        imported_count += 1
+                    else:
+                        # PDF/Image statement OCR
+                        from core.extraction import available_methods
+                        methods = available_methods(check_enabled=True)
+                        from core.ingestion import extract_statement
+                        res = extract_statement(p, filename=filename, default_year=default_year)
+                        
+                        import_id = f"file_{int(time.time())}_{idx}"
+                        st.session_state.pending_imports[import_id] = {
+                            "type": "statement",
+                            "filename": filename,
+                            "path": str(p),
+                            "rows": res.rows,
+                            "by_method": res.by_method,
+                            "method_used": res.method_used,
+                            "confidence": res.confidence
+                        }
+                        st.session_state.processed_files.add(file_key)
+                        pending_count += 1
+                except Exception as e:
+                    st.error(f"Failed to process statement `{filename}`: {e}")
+            
+            progress_bar.empty()
+            status_text.empty()
+            st.success(
+                f"Scan complete! Imported **{imported_count}** CSVs, "
+                f"added **{pending_count}** statements to review queue, "
+                f"skipped **{skipped_count}** duplicates.",
+                icon="✅"
+            )
+            st.rerun()
+
+    with col2:
         if st.button("🔍 Scan Folder Receipts (Batch OCR)", use_container_width=True):
             progress_bar = st.progress(0, text="Starting folder scan…")
             status_text = st.empty()

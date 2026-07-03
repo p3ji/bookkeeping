@@ -168,9 +168,9 @@ with col_receipt:
                 img_bytes = render_image_preview(rp)
                 
         if img_bytes:
-            st.image(img_bytes, use_container_width=True)
+            st.image(img_bytes, width="stretch")
         else:
-            st.image(str(rp), use_container_width=True)
+            st.image(str(rp), width="stretch")
 
         # Show structured data extracted from receipt
         raw_text = tx.get("raw_receipt_text") or ""
@@ -215,9 +215,12 @@ with col_receipt:
                     for field_name in ["vendor", "date", "total", "tax"]:
                         row_dict = {"Field": field_name.capitalize()}
                         for m in ["deterministic", "ollama", "cloud", "gemini", "playwright"]:
-                            m_data = extraction_details.get(m)
-                            if not m_data:
+                            if m not in extraction_details:
                                 row_dict[METHOD_LABELS.get(m, m)] = "—"
+                                continue
+                            m_data = extraction_details.get(m)
+                            if m_data is None:
+                                row_dict[METHOD_LABELS.get(m, m)] = "⚠️ Failed"
                                 continue
                             
                             # Resolve value
@@ -289,76 +292,76 @@ with col_receipt:
 
 # ── Classification form ───────────────────────────────────────────────────────
 with col_form:
-    with st.form(key=f"form_{tx_id}"):
+    # Removed st.form to enable live Deductible/ITC updates (Bug 3)
 
-        col_biz, col_pct = st.columns([1, 2])
-        with col_biz:
-            is_business = st.toggle(
-                "Business Expense",
-                value=bool(tx.get("is_business", True)),
-            )
-        with col_pct:
-            business_pct = st.slider(
-                "Business-Use %", 0, 100,
-                value=int(float(tx.get("business_percentage") or 1.0) * 100),
-                step=5,
-                disabled=not is_business,
-            )
-
-        cra_options   = [("", "— Select category —")] + list(CRA_LINES.items())
-        current_line  = tx.get("cra_line") or ""
-        try:
-            current_idx = [o[0] for o in cra_options].index(current_line)
-        except ValueError:
-            current_idx = 0
-
-        cra_choice = st.selectbox(
-            "CRA T2125 Category",
-            options=cra_options,
-            format_func=lambda o: f"Line {o[0]}: {o[1]}" if o[0] else o[1],
-            index=current_idx,
+    col_biz, col_pct = st.columns([1, 2])
+    with col_biz:
+        is_business = st.toggle(
+            "Business Expense",
+            value=bool(tx.get("is_business", True)),
+        )
+    with col_pct:
+        business_pct = st.slider(
+            "Business-Use %", 0, 100,
+            value=int(float(tx.get("business_percentage") or 1.0) * 100),
+            step=5,
             disabled=not is_business,
         )
-        cra_line = cra_choice[0]
-        cra_desc = cra_choice[1] if cra_choice[0] else None
 
-        gst_hst = st.number_input(
-            "GST/HST Amount ($)",
-            min_value=0.0,
-            value=float(tx.get("gst_hst_amount") or 0),
-            step=0.01, format="%.2f",
-            help="Auto-estimated. Override if your receipt shows a different amount.",
-        )
+    cra_options   = [("", "— Select category —")] + list(CRA_LINES.items())
+    current_line  = tx.get("cra_line") or ""
+    try:
+        current_idx = [o[0] for o in cra_options].index(current_line)
+    except ValueError:
+        current_idx = 0
 
-        notes = st.text_area(
-            "Notes",
-            value=tx.get("notes") or "",
-            placeholder="Business purpose, attendees, etc.",
-            height=80,
-        )
+    cra_choice = st.selectbox(
+        "CRA T2125 Category",
+        options=cra_options,
+        format_func=lambda o: f"Line {o[0]}: {o[1]}" if o[0] else o[1],
+        index=current_idx,
+        disabled=not is_business,
+    )
+    cra_line = cra_choice[0]
+    cra_desc = cra_choice[1] if cra_choice[0] else None
 
-        verified = st.checkbox(
-            "Mark as Verified ✅",
-            value=bool(tx.get("verified_status", False)),
-        )
+    gst_hst = st.number_input(
+        "GST/HST Amount ($)",
+        min_value=0.0,
+        value=float(tx.get("gst_hst_amount") or 0),
+        step=0.01, format="%.2f",
+        help="Auto-estimated. Override if your receipt shows a different amount.",
+    )
 
-        # Live deductible preview
-        amount_gross = float(tx.get("amount_gross") or 0)
-        biz_ratio    = business_pct / 100 if is_business else 0
-        breakdown    = calculate_deductible(amount_gross, gst_hst, biz_ratio,
-                                            is_business, cra_line)
-        pc1, pc2, pc3 = st.columns(3)
-        pc1.metric("Gross",       f"${amount_gross:,.2f}")
-        pc2.metric("Deductible",  f"${breakdown['deductible_gross']:,.2f}")
-        pc3.metric("ITC",         f"${breakdown['deductible_itc']:,.2f}")
-        if breakdown["note"]:
-            st.caption(f"ℹ️ {breakdown['note']}")
+    notes = st.text_area(
+        "Notes",
+        value=tx.get("notes") or "",
+        placeholder="Business purpose, attendees, etc.",
+        height=80,
+    )
 
-        col_save, col_export = st.columns(2)
-        save_btn   = col_save.form_submit_button("💾 Save", type="primary",
-                                                  use_container_width=True)
-        export_btn = col_export.form_submit_button("📄 Save & Export MD",
-                                                    use_container_width=True)
+    verified = st.checkbox(
+        "Mark as Verified ✅",
+        value=bool(tx.get("verified_status", False)),
+    )
+
+    # Live deductible preview
+    amount_gross = float(tx.get("amount_gross") or 0)
+    biz_ratio    = business_pct / 100 if is_business else 0
+    breakdown    = calculate_deductible(amount_gross, gst_hst, biz_ratio,
+                                        is_business, cra_line)
+    pc1, pc2, pc3 = st.columns(3)
+    pc1.metric("Gross",       f"${amount_gross:,.2f}")
+    pc2.metric("Deductible",  f"${breakdown['deductible_gross']:,.2f}")
+    pc3.metric("ITC",         f"${breakdown['deductible_itc']:,.2f}")
+    if breakdown["note"]:
+        st.caption(f"ℹ️ {breakdown['note']}")
+
+    col_save, col_export = st.columns(2)
+    save_btn   = col_save.button("💾 Save", key=f"save_btn_{tx_id}", type="primary",
+                                 use_container_width=True)
+    export_btn = col_export.button("📄 Save & Export MD", key=f"export_btn_{tx_id}",
+                                   use_container_width=True)
 
     if save_btn or export_btn:
         new_flags  = check_audit_flags(
