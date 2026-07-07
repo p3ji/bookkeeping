@@ -644,13 +644,15 @@ def _merge_fragmented_lines(lines: list[str], default_year: int) -> list[dict]:
             continue
 
         # If line has a date but no amount, try merging with subsequent lines
+        merged = False
         if (MONTH_RE.match(line) or DOUBLE_DATE_RE.match(line)) and not AMT_RE.search(line):
             for lookahead in range(1, 5):
                 j = i + lookahead
                 if j >= len(lines) or j in used:
                     continue
                 next_line = lines[j].strip()
-                # Stop merging when we hit another dated line — it's a new transaction
+                # Stop merging when we hit another dated line — it's a new transaction.
+                # (Bare break here must NOT skip advancing i, or line i loops forever.)
                 if MONTH_RE.match(next_line) or DOUBLE_DATE_RE.match(next_line):
                     break
                 candidate = (line + " " + next_line).strip()
@@ -660,10 +662,9 @@ def _merge_fragmented_lines(lines: list[str], default_year: int) -> list[dict]:
                     used.add(i)
                     used.add(j)
                     i = j + 1
+                    merged = True
                     break
-            else:
-                i += 1
-        else:
+        if not merged:
             i += 1
 
     return results

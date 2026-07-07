@@ -25,7 +25,37 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _OLLAMA_OK: Optional[bool] = None      # None = not yet checked
-_PREFERRED_MODELS = ["llama3.2-vision", "llava", "llava:13b", "llava:7b"]
+_PREFERRED_MODELS = ["llama3.2-vision", "llava", "llava:13b", "llava:7b",
+                     "minicpm-v", "qwen2.5vl", "granite3.2-vision", "moondream", "gemma3"]
+
+# Last runtime error from an actual Ollama inference call (not just availability).
+# A model can be *listed* yet fail to *load* (e.g. an mllama-architecture model on
+# an Ollama build that doesn't support it) — we capture that here so the UI can
+# explain why the LLM method produced nothing instead of silently skipping.
+_LAST_OLLAMA_ERROR: Optional[str] = None
+
+
+def ollama_last_error() -> Optional[str]:
+    """Return a human-readable reason the last Ollama call failed, or None."""
+    return _LAST_OLLAMA_ERROR
+
+
+def _note_ollama_failure(exc: Exception) -> None:
+    """Record an inference failure. If the model can't be loaded at all, stop
+    advertising Ollama as available for the rest of this session so the app
+    doesn't keep offering a method that cannot run."""
+    global _LAST_OLLAMA_ERROR, _OLLAMA_OK
+    msg = str(exc)
+    lowered = msg.lower()
+    if "unknown model architecture" in lowered or "error loading model" in lowered:
+        _LAST_OLLAMA_ERROR = (
+            "The installed Ollama runtime can't load this vision model "
+            "(architecture unsupported). Update Ollama, or pull a compatible "
+            "model such as `llava` or `minicpm-v`. Details: " + msg.splitlines()[0]
+        )
+        _OLLAMA_OK = False  # don't keep advertising a model that won't load
+    else:
+        _LAST_OLLAMA_ERROR = msg.splitlines()[0] if msg else "Unknown Ollama error"
 
 
 def _encode_image(path: Path) -> str:
@@ -43,10 +73,15 @@ def _encode_image(path: Path) -> str:
 
 
 def is_ollama_server_running() -> bool:
-    """Instantly check if the Ollama local server port 11434 is listening."""
+    """Quickly check if the Ollama local server port 11434 is listening.
+
+    Uses a 0.6s timeout: long enough that a live-but-busy server (e.g. mid-way
+    through loading a multi-GB vision model) still answers, short enough that a
+    genuinely absent server doesn't stall the UI.
+    """
     import socket
     try:
-        with socket.create_connection(("127.0.0.1", 11434), timeout=0.15):
+        with socket.create_connection(("127.0.0.1", 11434), timeout=0.6):
             return True
     except Exception:
         return False
@@ -168,6 +203,7 @@ def extract_statement_transactions(
                 continue
         return results
     except Exception as e:
+        _note_ollama_failure(e)
         logger.exception(f"Ollama Statement extraction failed for {image_path}")
         return None
 
@@ -231,6 +267,7 @@ def extract_receipt_data_llm(image_path: str | Path) -> dict | None:
             return None
         return json.loads(json_match.group(0))
     except Exception as e:
+        _note_ollama_failure(e)
         logger.exception(f"Ollama Receipt extraction failed for {image_path}")
         return None
 

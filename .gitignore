@@ -16,3 +16,6 @@ dist/
 build/
 .DS_Store
 Thumbs.db
+
+# Playwright MCP debug logs
+.playwright-mcp/

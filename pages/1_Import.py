@@ -183,6 +183,7 @@ if new_files_to_process or (fetch_btn and web_url):
                         "filename": filename,
                         "rows": res.rows,
                         "by_method": res.by_method,
+                        "method_status": res.method_status,
                         "confidence": res.confidence,
                         "method_used": res.method_used,
                     }
@@ -400,13 +401,23 @@ else:
                     # Display Method Performance Metrics
                     st.markdown("##### ⚙️ Extraction Method Performance")
                     by_method = item.get("by_method", {})
-                    cols_m = st.columns(len(by_method) if by_method else 1)
-                    idx = 0
+                    method_status = item.get("method_status", {})
                     from core.extraction import METHOD_LABELS
-                    for m, m_rows in by_method.items():
+                    _STATE_ICON = {"ok": "🟢", "empty": "🟡", "unavailable": "🔴"}
+                    cols_m = st.columns(len(by_method) if by_method else 1)
+                    for idx, (m, m_rows) in enumerate(by_method.items()):
                         count = len(m_rows) if isinstance(m_rows, list) else (0 if m_rows is None else 1)
-                        cols_m[idx].metric(label=METHOD_LABELS.get(m, m), value=f"{count} transactions")
-                        idx += 1
+                        stt = method_status.get(m, {})
+                        state = stt.get("state", "ok" if count else "empty")
+                        icon = _STATE_ICON.get(state, "")
+                        cols_m[idx].metric(
+                            label=f"{icon} {METHOD_LABELS.get(m, m)}",
+                            value=(f"{count} transactions" if state != "unavailable" else "unavailable"),
+                        )
+                    # Explain any method that could not run, so a silent skip is never mistaken for "found nothing"
+                    for m, stt in method_status.items():
+                        if stt.get("state") == "unavailable":
+                            st.warning(f"**{stt.get('label', m)} did not run.** {stt.get('detail', '')}", icon="🔴")
                         
                     st.markdown("##### 📋 Extracted Transactions Preview")
                     rows_df = pd.DataFrame(item["rows"])

@@ -39,6 +39,42 @@ class ExtractionResult:
     receipt: Any = None                                 # receipts: a ReceiptData
     flags: list[str] = field(default_factory=list)      # receipt-level disagreement notes
     by_method: dict = field(default_factory=dict)       # raw per-method output, for debugging
+    method_status: dict = field(default_factory=dict)   # per-method {label, state, detail}
+
+
+def _status_for(method: str, value, *, is_receipt: bool = False) -> dict:
+    """
+    Classify one method's outcome for honest UI reporting:
+      - "ok":          ran and produced data
+      - "empty":       ran but found nothing
+      - "unavailable": couldn't run (returned None — offline/model failure)
+    LLM 'unavailable' pulls in the last runtime error so the user sees WHY.
+    """
+    label = METHOD_LABELS.get(method, method)
+    if value is None:
+        detail = ""
+        if method in ("ollama",):
+            try:
+                from core.llm_extractor import ollama_last_error
+                detail = ollama_last_error() or ""
+            except Exception:
+                detail = ""
+        if not detail:
+            detail = "Method did not run (offline, disabled, or no data)."
+        return {"label": label, "state": "unavailable", "detail": detail}
+
+    if is_receipt:
+        rd = _as_receipt_data(value)
+        found = bool(rd and (rd.vendor or rd.total is not None or rd.date))
+        n = 1 if found else 0
+    else:
+        n = len(value) if isinstance(value, list) else 0
+        found = n > 0
+
+    if found:
+        return {"label": label, "state": "ok",
+                "detail": f"{n} found" if not is_receipt else "extracted"}
+    return {"label": label, "state": "empty", "detail": "ran, found nothing"}
 
 
 def available_methods(check_enabled: bool = True) -> list[str]:
@@ -224,7 +260,9 @@ def extract_statement(source, filename: str, methods: list[str] | None = None, d
 
     rows, method_used = _reconcile_statement_rows(by_method)
     confidence = _statement_confidence(rows)
-    return ExtractionResult(method_used=method_used, confidence=confidence, rows=rows, by_method=by_method)
+    status = {m: _status_for(m, by_method.get(m)) for m in methods if m in by_method}
+    return ExtractionResult(method_used=method_used, confidence=confidence, rows=rows,
+                            by_method=by_method, method_status=status)
 
 
 def extract_statement_auto(source, filename: str, default_year: int) -> ExtractionResult:
@@ -358,9 +396,10 @@ def extract_receipt(source, methods: list[str] | None = None) -> ExtractionResul
 
     receipt, method_used, flags = _reconcile_receipt(by_method)
     confidence = _receipt_confidence(receipt)
+    status = {m: _status_for(m, by_method.get(m), is_receipt=True) for m in methods if m in by_method}
     return ExtractionResult(
         method_used=method_used, confidence=confidence,
-        receipt=receipt, flags=flags, by_method=by_method,
+        receipt=receipt, flags=flags, by_method=by_method, method_status=status,
     )
 
 
