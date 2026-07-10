@@ -24,9 +24,13 @@ logger = logging.getLogger(__name__)
 # Ollama availability check
 # ---------------------------------------------------------------------------
 
-_OLLAMA_OK: Optional[bool] = None      # None = not yet checked
-_PREFERRED_MODELS = ["llama3.2-vision", "llava", "llava:13b", "llava:7b",
-                     "minicpm-v", "qwen2.5vl", "granite3.2-vision", "moondream", "gemma3"]
+# Preference order for auto-selection. llama3.2-vision is listed last: Ollama
+# >=0.30.0 dropped support for its 'mllama' architecture (upstream llama.cpp never
+# implemented it — https://github.com/ollama/ollama/issues/16490), so on current
+# Ollama builds it reliably fails to load. Kept in the list (rather than removed)
+# in case a future Ollama/llama.cpp release restores support.
+_PREFERRED_MODELS = ["qwen2.5vl", "minicpm-v", "granite3.2-vision", "moondream",
+                     "gemma3", "llava", "llava:13b", "llava:7b", "llama3.2-vision"]
 
 # Last runtime error from an actual Ollama inference call (not just availability).
 # A model can be *listed* yet fail to *load* (e.g. an mllama-architecture model on
@@ -34,26 +38,39 @@ _PREFERRED_MODELS = ["llama3.2-vision", "llava", "llava:13b", "llava:7b",
 # explain why the LLM method produced nothing instead of silently skipping.
 _LAST_OLLAMA_ERROR: Optional[str] = None
 
+# Models that failed to *load* this session (e.g. unsupported architecture on the
+# installed Ollama build). Kept separate from "not installed" so we can skip a
+# known-broken model and fall through to the next installed one, instead of
+# giving up on Ollama entirely just because the first-preference model is broken.
+_OLLAMA_BROKEN_MODELS: set[str] = set()
+
+# Ollama's chat API defaults num_ctx to 4096 regardless of a model's max context
+# length. A single statement/receipt photo alone can burn ~4200+ tokens just
+# encoding the image, so the default silently truncates/rejects real requests.
+# 8192 gives headroom for image tokens + prompt + a multi-transaction JSON reply.
+_OLLAMA_NUM_CTX = 8192
+
 
 def ollama_last_error() -> Optional[str]:
     """Return a human-readable reason the last Ollama call failed, or None."""
     return _LAST_OLLAMA_ERROR
 
 
-def _note_ollama_failure(exc: Exception) -> None:
-    """Record an inference failure. If the model can't be loaded at all, stop
-    advertising Ollama as available for the rest of this session so the app
-    doesn't keep offering a method that cannot run."""
-    global _LAST_OLLAMA_ERROR, _OLLAMA_OK
+def _note_ollama_failure(exc: Exception, model: Optional[str] = None) -> None:
+    """Record an inference failure. If the model can't be loaded at all, mark
+    just that model as broken (so callers fall through to the next installed
+    model) rather than disabling Ollama support for the whole session."""
+    global _LAST_OLLAMA_ERROR
     msg = str(exc)
     lowered = msg.lower()
     if "unknown model architecture" in lowered or "error loading model" in lowered:
         _LAST_OLLAMA_ERROR = (
-            "The installed Ollama runtime can't load this vision model "
-            "(architecture unsupported). Update Ollama, or pull a compatible "
-            "model such as `llava` or `minicpm-v`. Details: " + msg.splitlines()[0]
+            f"Ollama model `{model}` can't be loaded by the installed Ollama runtime "
+            "(architecture unsupported). Update Ollama, or use a different installed "
+            "vision model. Details: " + msg.splitlines()[0]
         )
-        _OLLAMA_OK = False  # don't keep advertising a model that won't load
+        if model:
+            _OLLAMA_BROKEN_MODELS.add(model)
     else:
         _LAST_OLLAMA_ERROR = msg.splitlines()[0] if msg else "Unknown Ollama error"
 
@@ -87,8 +104,28 @@ def is_ollama_server_running() -> bool:
         return False
 
 
+def _ranked_vision_models(skip_broken: bool = True) -> list[str]:
+    """All installed vision models, in preference order. Excludes models already
+    known to fail to load this session unless skip_broken=False (used by the
+    Settings/diagnostics page, which wants to show broken models too)."""
+    try:
+        import ollama
+        models = [m.model for m in ollama.list().models]
+    except Exception:
+        return []
+    ranked = []
+    for pref in _PREFERRED_MODELS:
+        for m in models:
+            if pref in m and m not in ranked:
+                if skip_broken and m in _OLLAMA_BROKEN_MODELS:
+                    continue
+                ranked.append(m)
+    return ranked
+
+
 def is_ollama_available() -> bool:
-    """Return True if the Ollama server is running and has a vision model."""
+    """Return True if the Ollama server is running and has a usable vision model
+    (installed AND not already known to fail to load this session)."""
     from core.database import get_setting
     if get_setting("ollama_enabled", "true") == "false":
         return False
@@ -96,34 +133,16 @@ def is_ollama_available() -> bool:
     if not is_ollama_server_running():
         return False
 
-    global _OLLAMA_OK
-    if _OLLAMA_OK is not None:
-        return _OLLAMA_OK
-    try:
-        import ollama
-        models = [m.model for m in ollama.list().models]
-        _OLLAMA_OK = any(
-            any(pref in m for pref in _PREFERRED_MODELS) for m in models
-        )
-    except Exception:
-        _OLLAMA_OK = False
-    return _OLLAMA_OK
+    return bool(_ranked_vision_models())
 
 
 def ollama_vision_model() -> Optional[str]:
-    """Return the name of the first available vision model, or None."""
+    """Return the name of the first usable (installed, not known-broken) vision
+    model, or None."""
     if not is_ollama_server_running():
         return None
-    try:
-        import ollama
-        models = [m.model for m in ollama.list().models]
-        for pref in _PREFERRED_MODELS:
-            for m in models:
-                if pref in m:
-                    return m
-    except Exception:
-        pass
-    return None
+    ranked = _ranked_vision_models()
+    return ranked[0] if ranked else None
 
 
 # ---------------------------------------------------------------------------
@@ -153,59 +172,66 @@ def extract_statement_transactions(
 ) -> list[dict] | None:
     """
     Use a local Ollama vision LLM to extract transactions from a statement image.
-    Returns list of {date, vendor, amount_gross} dicts on success, None on failure.
+    Tries installed vision models in preference order, skipping any that fail to
+    *load* (e.g. an unsupported architecture) so one broken model doesn't take
+    down the whole method. Returns list of {date, vendor, amount_gross} dicts on
+    success, None if every candidate model failed or none is installed.
     """
     path = Path(image_path)
     if not path.exists():
         logger.error(f"Ollama Statement extraction failed: file does not exist {image_path}")
         return None
 
-    model = ollama_vision_model()
-    if not model:
+    candidates = _ranked_vision_models()
+    if not candidates:
         logger.warning("Ollama Statement extraction skipped: no vision model found or server offline")
         return None
 
-    try:
-        import ollama
-        img_b64 = _encode_image(path)
-        response = ollama.chat(
-            model=model,
-            messages=[{
-                "role": "user",
-                "content": _STATEMENT_PROMPT,
-                "images": [img_b64],
-            }],
-            options={"temperature": 0},
-        )
-        raw = response.message.content.strip()
-        # Extract JSON array from response (model sometimes adds prose)
-        json_match = re.search(r"\[.*\]", raw, re.DOTALL)
-        if not json_match:
-            logger.error(f"Ollama Statement extraction failed: no JSON array found in response: {raw}")
+    for model in candidates:
+        try:
+            import ollama
+            img_b64 = _encode_image(path)
+            response = ollama.chat(
+                model=model,
+                messages=[{
+                    "role": "user",
+                    "content": _STATEMENT_PROMPT,
+                    "images": [img_b64],
+                }],
+                options={"temperature": 0, "num_ctx": _OLLAMA_NUM_CTX},
+            )
+            raw = response.message.content.strip()
+            # Extract JSON array from response (model sometimes adds prose)
+            json_match = re.search(r"\[.*\]", raw, re.DOTALL)
+            if not json_match:
+                logger.error(f"Ollama Statement extraction failed: no JSON array found in response: {raw}")
+                return None
+            rows = json.loads(json_match.group(0))
+            results = []
+            for row in rows:
+                try:
+                    import pandas as pd
+                    date_str = pd.to_datetime(str(row.get("date", "")),
+                                              dayfirst=False).strftime("%Y-%m-%d")
+                    amount = float(row.get("amount", 0))
+                    vendor = str(row.get("vendor", "")).strip()
+                    if date_str and amount > 0 and vendor:
+                        results.append({
+                            "date": date_str,
+                            "vendor": vendor,
+                            "amount_gross": round(amount, 2),
+                        })
+                except Exception as e:
+                    logger.warning(f"Ollama Statement row extraction skipped row {row}: {e}")
+                    continue
+            return results
+        except Exception as e:
+            _note_ollama_failure(e, model)
+            logger.exception(f"Ollama Statement extraction failed for {image_path} with model {model}")
+            if model in _OLLAMA_BROKEN_MODELS:
+                continue  # try the next candidate model
             return None
-        rows = json.loads(json_match.group(0))
-        results = []
-        for row in rows:
-            try:
-                import pandas as pd
-                date_str = pd.to_datetime(str(row.get("date", "")),
-                                          dayfirst=False).strftime("%Y-%m-%d")
-                amount = float(row.get("amount", 0))
-                vendor = str(row.get("vendor", "")).strip()
-                if date_str and amount > 0 and vendor:
-                    results.append({
-                        "date": date_str,
-                        "vendor": vendor,
-                        "amount_gross": round(amount, 2),
-                    })
-            except Exception as e:
-                logger.warning(f"Ollama Statement row extraction skipped row {row}: {e}")
-                continue
-        return results
-    except Exception as e:
-        _note_ollama_failure(e)
-        logger.exception(f"Ollama Statement extraction failed for {image_path}")
-        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -236,40 +262,46 @@ Rules:
 def extract_receipt_data_llm(image_path: str | Path) -> dict | None:
     """
     Use a local Ollama vision LLM to extract structured data from a receipt image.
-    Returns dict matching ReceiptData fields on success, None on failure.
+    Tries installed vision models in preference order, skipping any that fail to
+    *load* so one broken model doesn't take down the whole method. Returns dict
+    matching ReceiptData fields on success, None if every candidate failed.
     """
     path = Path(image_path)
     if not path.exists():
         logger.error(f"Ollama Receipt extraction failed: file does not exist {image_path}")
         return None
 
-    model = ollama_vision_model()
-    if not model:
+    candidates = _ranked_vision_models()
+    if not candidates:
         logger.warning("Ollama Receipt extraction skipped: no vision model found or server offline")
         return None
 
-    try:
-        import ollama
-        img_b64 = _encode_image(path)
-        response = ollama.chat(
-            model=model,
-            messages=[{
-                "role": "user",
-                "content": _RECEIPT_PROMPT,
-                "images": [img_b64],
-            }],
-            options={"temperature": 0},
-        )
-        raw = response.message.content.strip()
-        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not json_match:
-            logger.error(f"Ollama Receipt extraction failed: no JSON object found in response: {raw}")
+    for model in candidates:
+        try:
+            import ollama
+            img_b64 = _encode_image(path)
+            response = ollama.chat(
+                model=model,
+                messages=[{
+                    "role": "user",
+                    "content": _RECEIPT_PROMPT,
+                    "images": [img_b64],
+                }],
+                options={"temperature": 0, "num_ctx": _OLLAMA_NUM_CTX},
+            )
+            raw = response.message.content.strip()
+            json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not json_match:
+                logger.error(f"Ollama Receipt extraction failed: no JSON object found in response: {raw}")
+                return None
+            return json.loads(json_match.group(0))
+        except Exception as e:
+            _note_ollama_failure(e, model)
+            logger.exception(f"Ollama Receipt extraction failed for {image_path} with model {model}")
+            if model in _OLLAMA_BROKEN_MODELS:
+                continue  # try the next candidate model
             return None
-        return json.loads(json_match.group(0))
-    except Exception as e:
-        _note_ollama_failure(e)
-        logger.exception(f"Ollama Receipt extraction failed for {image_path}")
-        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
